@@ -17,9 +17,11 @@ function until(cab, condition) {
 test('a wandering cab passes successive side-road junctions and rejoins at C',()=>{
   const cab=trip();
   divert(cab);
-  until(cab,()=>cab.mode==='route');
-  assert.equal(cab.index,2);
-  assert.deepEqual(cab.point,nodes.C);
+  until(cab,()=>cab.from==='C');
+  assert.equal(cab.mode,'detour');
+  for(let i=0;i<200;i++)advance(cab);
+  assert.equal(cab.mode,'detour');
+  rejoin(cab);
   until(cab,()=>cab.mode==='arrived');
 });
 
