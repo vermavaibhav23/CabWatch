@@ -36,6 +36,7 @@ async def lifespan(app):
         app.state.db = db
         app.state.producer = producer
         app.state.cab_stream = stream
+        await stream.start()
         yield
 
 
@@ -48,3 +49,4 @@ app.mount("/cab-watch/assets", StaticFiles(directory=assets), name="assets")
 @app.get("/", include_in_schema=False)
 async def home():
     return RedirectResponse("/cab-watch/")
+

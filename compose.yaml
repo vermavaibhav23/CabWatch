@@ -38,10 +38,15 @@ services:
       DATABASE_URL: postgresql://cabwatch:cabwatch@db/cabwatch
       KAFKA_BOOTSTRAP_SERVERS: broker:9092
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GPS_RETENTION_DAYS: ${GPS_RETENTION_DAYS:-7}
+      TRIP_RETENTION_DAYS: ${TRIP_RETENTION_DAYS:-90}
+      FLEET_RETENTION_DAYS: ${FLEET_RETENTION_DAYS:-365}
+      RETENTION_INTERVAL_HOURS: ${RETENTION_INTERVAL_HOURS:-6}
     depends_on:
       db: {condition: service_healthy}
       broker: {condition: service_healthy}
 volumes:
   cabwatch-db: {}
   cabwatch-kafka: {}
+
 

@@ -37,3 +37,45 @@ test('recovery from midway along EF follows roads to the cheaper endpoint',()=>{
     assert.deepEqual(cab.point,nodes[junction]);
   }
 });
+
+test('a dispatched car visits pickup, drop-off, and returns to its depot',()=>{
+  const legs=[
+    {stops:['A','B'],path:[nodes.A,nodes.B]},
+    {stops:['B','C'],path:[nodes.B,nodes.C]},
+    {stops:['C','B','A'],path:[nodes.C,nodes.B,nodes.A]},
+  ];
+  const cab=makeCab({legs,stops:['A','B','C','B','A'],path:[nodes.A,nodes.B,nodes.C,nodes.B,nodes.A]},network);
+  assert.equal(cab.leg,0);
+  until(cab,()=>cab.leg===1);
+  assert.deepEqual(cab.point,nodes.B);
+  until(cab,()=>cab.leg===2);
+  assert.deepEqual(cab.point,nodes.C);
+  until(cab,()=>cab.mode==='arrived');
+  assert.equal(cab.leg,2);
+  assert.deepEqual(cab.point,nodes.A);
+});
+
+test('pickup at the depot skips the empty first leg',()=>{
+  const legs=[
+    {stops:['A'],path:[nodes.A]},
+    {stops:['A','B'],path:[nodes.A,nodes.B]},
+    {stops:['B','A'],path:[nodes.B,nodes.A]},
+  ];
+  const cab=makeCab({legs,stops:['A','B','A'],path:[nodes.A,nodes.B,nodes.A]},network);
+  assert.equal(cab.leg,1);
+  until(cab,()=>cab.mode==='arrived');
+  assert.equal(cab.leg,2);
+});
+
+test('drop-off at the home depot completes the empty return leg',()=>{
+  const legs=[
+    {stops:['A','B'],path:[nodes.A,nodes.B]},
+    {stops:['B','A'],path:[nodes.B,nodes.A]},
+    {stops:['A'],path:[nodes.A]},
+  ];
+  const cab=makeCab({legs,stops:['A','B','A'],path:[nodes.A,nodes.B,nodes.A]},network);
+  until(cab,()=>cab.mode==='arrived');
+  assert.equal(cab.leg,2);
+  assert.deepEqual(cab.point,nodes.A);
+});
+
