@@ -34,7 +34,10 @@ async def cleanup(db, gps_days, trip_days, fleet_days):
               AND g.sequence<>t.last_sequence
               AND g.received_at < now()-($1::int * interval '1 day')""", gps_days)
         trips = await conn.execute("""DELETE FROM cab_watch.trips
-            WHERE coalesce(completed_at,created_at) < now()-($1::int * interval '1 day')""",
+            WHERE (completed_at IS NOT NULL
+                   AND completed_at < now()-($1::int * interval '1 day'))
+               OR (vehicle_id IS NULL
+                   AND created_at < now()-($1::int * interval '1 day'))""",
             trip_days)
         vehicles = await conn.execute("""DELETE FROM cab_watch.vehicles v
             WHERE v.created_at < now()-($1::int * interval '1 day')
