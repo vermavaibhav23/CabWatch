@@ -3,9 +3,9 @@ import test from 'node:test';
 import {makeCab, divert, advance, rejoin} from './cab_watch/assets/motion.mjs';
 
 // A---B---C---D is the plan. A---E---F---C is a longer side road.
-const nodes = {A:[0,0], B:[100,0], C:[200,0], D:[300,0], E:[0,100], F:[200,100]};
-const network = {nodes, roads:['AB','BC','CD','AE','EF','FC']};
-const stops = ['A','B','C','D'];
+const nodes = {P:[-80,0], A:[0,0], B:[100,0], C:[200,0], D:[300,0], E:[0,100], F:[200,100]};
+const network = {nodes, roads:['PA','AB','BC','CD','AE','EF','FC']};
+const stops = ['P','A','B','C','D'];
 function trip() {
   return makeCab({stops, path:stops.map(n=>nodes[n])}, network);
 }
@@ -16,7 +16,14 @@ function until(cab, condition) {
 
 test('a wandering cab passes successive side-road junctions and rejoins at C',()=>{
   const cab=trip();
+  advance(cab);
   divert(cab);
+  assert.equal(cab.mode,'turn requested');
+  const x=cab.point[0]; advance(cab);
+  assert.ok(cab.point[0]>x);
+  until(cab,()=>cab.mode==='detour');
+  assert.deepEqual(cab.point,nodes.A);
+  assert.equal(cab.to,'E');
   until(cab,()=>cab.from==='C');
   assert.equal(cab.mode,'detour');
   for(let i=0;i<200;i++)advance(cab);

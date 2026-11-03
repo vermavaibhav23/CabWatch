@@ -17,7 +17,8 @@ class CabGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(offset_metres(0, *gps((45,80))), 210, places=5)
 
     def test_boundary_gap_and_recovery(self):
-        self.assertEqual(next_streak(200,2,True),0)
+        self.assertEqual(next_streak(199.99,0,True),0)
+        self.assertEqual(next_streak(200,0,True),1)
         self.assertEqual(next_streak(201,2,True),3)
         self.assertEqual(next_streak(201,2,False),1)
 

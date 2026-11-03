@@ -20,11 +20,11 @@ Intersections and road lengths form a weighted adjacency list. FastAPI runs Dijk
 
 1. The browser submits a trip ID, sequence, leg number, latitude, and longitude to FastAPI. Every tick advances five simulated seconds, with six metres per map unit.
 2. The producer publishes one JSON message per moving car to Kafka topic `cab.location`, keyed by trip ID. The topic has two partitions.
-3. The consumer measures each reading against **the planned route for its current leg**, not the whole round trip. Three consecutive readings more than 200 m away open one alert. A reading within 200 m resolves it. Duplicate or older sequences do not advance the detector.
+3. The consumer measures each reading against **the planned route for its current leg**, not the whole round trip. The first reading at least 200 m away opens an alert. A reading below 200 m resolves it. Duplicate or older sequences do not advance the detector.
 4. The consumer saves the GPS reading and detector state in one PostgreSQL transaction, then commits the Kafka offset. A replay after a crash is skipped using the saved sequence number.
 5. The dashboard polls for the confirmed position, moves the marker, and shows the alert. **Explain alert** asks Gemini to explain stored evidence on demand. If the model or quota is unavailable, the UI labels its rule-based explanation.
 
-PostgreSQL has five tables under `cab_watch`: `depots` stores fixed depot nodes; `vehicles` stores the cars in a fleet and their availability; `trips` stores vehicle assignment, the three planned legs, and detector state; `gps_readings` stores coordinates and offsets; and `alerts` stores opening and closing readings. Each alert also stores its three opening measurements so it can still be explained after older GPS rows expire. A unique index permits one open alert per trip.
+PostgreSQL has five tables under `cab_watch`: `depots` stores fixed depot nodes; `vehicles` stores the cars in a fleet and their availability; `trips` stores vehicle assignment, the three planned legs, and detector state; `gps_readings` stores coordinates and offsets; and `alerts` stores opening and closing readings. Each alert also stores its opening GPS evidence so it can still be explained after older GPS rows expire. A unique index permits one open alert per trip.
 
 ## Data retention
 
