@@ -1,5 +1,6 @@
 """Optional end-to-end ownership check against a running CabWatch instance."""
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 import secrets
 import time
@@ -55,11 +56,21 @@ class AccountFlow(unittest.TestCase):
             other=client.put("me/fleet",headers=b,json={"count":2}).json()["vehicles"]
             self.assertTrue(plates.isdisjoint(v["id"] for v in other))
             client.put("me/fleet",headers=b,json={"count":1}).raise_for_status()
-            tid = str(uuid4())
-            path = "me/trips/" + tid
+            path = "me/trips"
+            key = str(uuid4())
+            headers = {**a, "Idempotency-Key": key}
             route = dict(pickup="G", dropoff="K")
-            trip = client.put(path, json=route, headers=a)
-            trip.raise_for_status()
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                replies = list(executor.map(lambda _: client.post(path, json=route, headers=headers), range(2)))
+            self.assertEqual(sorted(r.status_code for r in replies), [200, 201])
+            trip = replies[0]
+            tid = trip.json()["id"]
+            self.assertEqual(replies[1].json()["id"], tid)
+            self.assertNotEqual(tid, key)
+            self.assertEqual(client.post(path, json=dict(pickup="A", dropoff="K"), headers=headers).status_code, 409)
+            independent = client.post(path, json=route, headers={**b, "Idempotency-Key": key})
+            self.assertEqual(independent.status_code, 201)
+            self.assertNotEqual(independent.json()["id"], tid)
             counts[by_node["A"]] -= 1
             self.assertEqual(trip.json()["parked_counts"], counts)
             self.assertEqual(trip.json()["departure_depot_id"], by_node["A"])
@@ -69,8 +80,8 @@ class AccountFlow(unittest.TestCase):
             self.assertEqual(plan["customer_ride"], ["G","H","I","J","K"])
             self.assertEqual(plan["to_pickup"], ["A","G"])
             self.assertEqual(plan["to_depot"], ["K","E"])
-            self.assertEqual(client.put(path,json=route,headers=a).json()["planned_legs"],plan)
-            self.assertEqual(client.put(path, json=route, headers=b).status_code, 409)
+            self.assertEqual(client.put(path+"/"+tid,json=route,headers=a).json()["planned_legs"],plan)
+            self.assertEqual(client.put(path+"/"+tid, json=route, headers=b).status_code, 409)
             repeated = client.put("me/fleet", headers=a, json={"count": 50}).json()
             self.assertEqual(
                 [c["id"] for c in cars], [c["id"] for c in repeated["vehicles"]]

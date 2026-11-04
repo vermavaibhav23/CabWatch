@@ -161,3 +161,10 @@ ALTER TABLE cab_watch_accounts.alerts DROP COLUMN IF EXISTS opening_samples;
 CREATE UNIQUE INDEX IF NOT EXISTS one_open_alert ON cab_watch_accounts.alerts(trip_id) WHERE closed_sequence IS NULL;
 CREATE INDEX IF NOT EXISTS gps_received_at ON cab_watch_accounts.gps_readings(received_at);
 
+
+CREATE TABLE IF NOT EXISTS cab_watch_accounts.dispatch_requests (
+    user_id uuid NOT NULL REFERENCES cab_watch_accounts.users,
+    request_key uuid NOT NULL,
+    trip_id uuid NOT NULL UNIQUE REFERENCES cab_watch_accounts.trips ON DELETE CASCADE,
+    PRIMARY KEY (user_id, request_key)
+);

@@ -2,8 +2,8 @@
 
 import json
 from collections import Counter
-from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, Request
+from uuid import UUID, uuid4
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from . import city
 from .auth import owner
@@ -182,64 +182,92 @@ async def resize(setup: Setup, request: Request, user: UUID = Depends(owner)):
         return await snapshot(conn, user, plans=True)
 
 
-@router.put("/trips/{trip_id}")
+@router.post("/trips", status_code=201, responses={200: {"description": "Previously created trip"}})
+async def create_trip(
+    setup: TripRequest, request: Request, response: Response,
+    idempotency_key: UUID = Header(alias="Idempotency-Key"), user: UUID = Depends(owner),
+):
+    async with request.app.state.db.acquire() as conn, conn.transaction():
+        await lock_fleet(conn, user)
+        previous_id = await conn.fetchval(
+            """SELECT trip_id FROM cab_watch_accounts.dispatch_requests
+               WHERE user_id=$1 AND request_key=$2""", user, idempotency_key,
+        )
+        trip_id = previous_id or uuid4()
+        payload = await dispatch_locked(conn, user, trip_id, setup)
+        if previous_id is None:
+            await conn.execute(
+                """INSERT INTO cab_watch_accounts.dispatch_requests(user_id, request_key, trip_id)
+                   VALUES($1,$2,$3)""", user, idempotency_key, trip_id,
+            )
+        else:
+            response.status_code = 200
+        return payload
+
+
+@router.put("/trips/{trip_id}", deprecated=True)
 async def dispatch(
     trip_id: UUID, setup: TripRequest, request: Request, user: UUID = Depends(owner)
 ):
+    async with request.app.state.db.acquire() as conn, conn.transaction():
+        await lock_fleet(conn, user)
+        return await dispatch_locked(conn, user, trip_id, setup)
+
+
+async def dispatch_locked(conn, user, trip_id, setup):
     if setup.pickup == setup.dropoff:
         raise HTTPException(422, "Choose different pickup and drop-off nodes.")
-    db = request.app.state.db
-    async with db.acquire() as conn, conn.transaction():
-        await lock_fleet(conn, user)
-        # Serialize retries and collisions, including requests from different accounts.
-        await conn.execute(
-            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))", str(trip_id)
-        )
-        existing = await conn.fetchrow(
-            """SELECT t.*,v.user_id,v.cab_number FROM cab_watch_accounts.trips t
-            JOIN cab_watch_accounts.vehicles v ON v.id=t.vehicle_id WHERE t.id=$1""",
-            trip_id,
-        )
-        depots = await list_depots(conn)
-        depots_by_node = {d["node"]: d for d in depots}
-        if existing:
-            if existing["user_id"] != user:
-                raise HTTPException(409, "Trip ID unavailable.")
-            payload = trip_payload(existing, depots_by_node)
-            if (payload["origin"], payload["destination"]) != (setup.pickup, setup.dropoff):
-                raise HTTPException(409, "Trip ID unavailable.")
-            payload["parked_counts"] = await parked_counts(conn, user)
-            return payload
-        cars = await vehicles(conn, user)
-        idle = [v for v in cars if v["status"] == "available"]
-        if not idle:
-            raise HTTPException(409, "No available cabs in your fleet.")
-        car = min(
-            idle,
-            key=lambda v: (
-                city.shortest_route(v["current_node"], setup.pickup)[1],
-                v["cab"],
-            ),
-        )
-        arrival = min(
-            depots, key=lambda d: city.shortest_route(setup.dropoff, d["node"])[1]
-        )
-        legs = {
-            "to_pickup": city.shortest_route(car["current_node"], setup.pickup)[0],
-            "customer_ride": city.shortest_route(setup.pickup, setup.dropoff)[0],
-            "to_depot": city.shortest_route(setup.dropoff, arrival["node"])[0],
-        }
-        row = await conn.fetchrow(
-            """INSERT INTO cab_watch_accounts.trips (id,vehicle_id,planned_legs)
-            VALUES($1,$2,$3::jsonb) RETURNING *""",
-            trip_id,
-            car["id"],
-            json.dumps(legs),
-        )
-        await conn.execute(
-            "UPDATE cab_watch_accounts.vehicles SET status='busy',parked_depot_id=NULL WHERE id=$1",
-            car["id"],
-        )
-        payload = trip_payload(dict(row, cab_number=car["cab"]), depots_by_node)
+    # Serialize retries and collisions, including requests from different accounts.
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))", str(trip_id)
+    )
+    existing = await conn.fetchrow(
+        """SELECT t.*,v.user_id,v.cab_number FROM cab_watch_accounts.trips t
+        JOIN cab_watch_accounts.vehicles v ON v.id=t.vehicle_id WHERE t.id=$1""",
+        trip_id,
+    )
+    depots = await list_depots(conn)
+    depots_by_node = {d["node"]: d for d in depots}
+    if existing:
+        if existing["user_id"] != user:
+            raise HTTPException(409, "Trip ID unavailable.")
+        payload = trip_payload(existing, depots_by_node)
+        if (payload["origin"], payload["destination"]) != (setup.pickup, setup.dropoff):
+            raise HTTPException(409, "This request already created a trip with different stops.")
         payload["parked_counts"] = await parked_counts(conn, user)
         return payload
+    cars = await vehicles(conn, user)
+    idle = [v for v in cars if v["status"] == "available"]
+    if not idle:
+        raise HTTPException(409, "No available cabs in your fleet.")
+    pickup_routes = {node: city.shortest_route(node, setup.pickup)
+                     for node in {v["current_node"] for v in idle}}
+    car = min(
+        idle,
+        key=lambda v: (
+            pickup_routes[v["current_node"]][1],
+            v["cab"],
+        ),
+    )
+    arrival = min(
+        depots, key=lambda d: city.shortest_route(setup.dropoff, d["node"])[1]
+    )
+    legs = {
+        "to_pickup": pickup_routes[car["current_node"]][0],
+        "customer_ride": city.shortest_route(setup.pickup, setup.dropoff)[0],
+        "to_depot": city.shortest_route(setup.dropoff, arrival["node"])[0],
+    }
+    row = await conn.fetchrow(
+        """INSERT INTO cab_watch_accounts.trips (id,vehicle_id,planned_legs)
+        VALUES($1,$2,$3::jsonb) RETURNING *""",
+        trip_id,
+        car["id"],
+        json.dumps(legs),
+    )
+    await conn.execute(
+        "UPDATE cab_watch_accounts.vehicles SET status='busy',parked_depot_id=NULL WHERE id=$1",
+        car["id"],
+    )
+    payload = trip_payload(dict(row, cab_number=car["cab"]), depots_by_node)
+    payload["parked_counts"] = await parked_counts(conn, user)
+    return payload

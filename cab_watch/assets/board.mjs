@@ -3,13 +3,13 @@ import {cityMap,drawDepots,makeLayers,drawSharedRoads,selectMap,showPoint,animat
 
 const $=id=>document.getElementById(id);
 const STAGES=['To pickup','With customer','Returning to depot'];
-let fleet,selected,running=false,frame,timer,changing=false,reviewGeneration=0,network,draftId;
+let fleet,selected,running=false,frame,timer,changing=false,reviewGeneration=0,network,dispatchKey;
 const msg=text=>{$('message').textContent=text;};
 const element=(tag,text,cls)=>{const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e;};
 
-async function api(path,method='GET',body){
+async function api(path,method='GET',body,extraHeaders={}){
   const token=sessionStorage.getItem('cabwatch.token');
-  const headers={'Content-Type':'application/json'};
+  const headers={'Content-Type':'application/json',...extraHeaders};
   if(token && !path.startsWith('auth/'))headers.Authorization='Bearer '+token;
   const response=await fetch('/cab-watch/'+path,{method,cache:'no-store',headers,
     body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(35000)});
@@ -169,7 +169,7 @@ function pick(name){
   if(!$('launch').disabled)launch();
 }
 function openPlanner(){
-  draftId=crypto.randomUUID();
+  dispatchKey=crypto.randomUUID();
   $('pickup').value='';$('dropoff').value='';$('planner').hidden=false;
   $('map').classList.add('picking');
   for(const node of document.querySelectorAll('.junction'))node.setAttribute('tabindex','0');
@@ -193,8 +193,8 @@ async function launch(){
   for(const id of ['launch','cancel','reset','pickup','dropoff','fleetSize'])$(id).disabled=true;
   msg('Finding the closest available car by road…');
   try{
-    const trip=await api('me/trips/'+draftId,'PUT',
-      {pickup:$('pickup').value,dropoff:$('dropoff').value});
+    const trip=await api('me/trips','POST',
+      {pickup:$('pickup').value,dropoff:$('dropoff').value},{'Idempotency-Key':dispatchKey});
     if(f!==fleet)return;
     const c=makeCab(trip,network);
     f.cabs.push(c);makeLayers([c],select);drawSharedRoads(f.cabs,network);
