@@ -1,6 +1,6 @@
 import unittest
 from cab_watch.city import (GRAPH, NODES, shortest_route, ROUTES, gps, next_streak,
-                            offset_metres, distance_from_path, DEPOTS, depot_allocation,
+                            offset_metres, distance_from_path, depot_allocation,
                             nearest_available)
 
 
@@ -44,11 +44,11 @@ class RoutingTests(unittest.TestCase):
 class FleetTests(unittest.TestCase):
     def test_every_fleet_size_is_split_as_evenly_as_possible(self):
         for count in range(1, 21):
-            allocation = depot_allocation(count)
-            self.assertEqual(len(allocation), len(DEPOTS))
+            allocation = depot_allocation(count, 4)
+            self.assertEqual(len(allocation), 4)
             self.assertEqual(sum(allocation), count)
             self.assertLessEqual(max(allocation) - min(allocation), 1)
-        self.assertEqual(depot_allocation(10), [3, 3, 2, 2])
+        self.assertEqual(depot_allocation(10, 4), [3, 3, 2, 2])
 
     def test_nearest_available_car_uses_road_distance(self):
         vehicles = [

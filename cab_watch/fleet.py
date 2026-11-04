@@ -9,7 +9,10 @@ from . import city
 from .auth import owner
 
 router = APIRouter(prefix="/me")
-DEPOTS = {depot["id"]: depot for depot in city.DEPOTS}
+
+
+async def list_depots(conn):
+    return await conn.fetch("SELECT id, name, node FROM cab_watch_accounts.depots ORDER BY node")
 
 
 class Setup(BaseModel):
@@ -36,7 +39,19 @@ async def vehicles(conn, user):
     )
 
 
-def trip_payload(row):
+async def parked_counts(conn, user):
+    rows = await conn.fetch(
+        """SELECT d.id, count(v.id) AS parked
+        FROM cab_watch_accounts.depots d
+        LEFT JOIN cab_watch_accounts.vehicles v
+          ON v.parked_depot_id=d.id AND v.user_id=$1 AND v.retired_at IS NULL
+        GROUP BY d.id""",
+        user,
+    )
+    return {str(row["id"]): row["parked"] for row in rows}
+
+
+def trip_payload(row, depots_by_node):
     parts = row["planned_legs"]
     if isinstance(parts, str):
         parts = json.loads(parts)
@@ -53,8 +68,10 @@ def trip_payload(row):
         id=row["id"],
         vehicle_id=row["vehicle_id"],
         cab=row["cab_number"],
-        depot=city.DEPOT_BY_NODE[parts["to_pickup"][0]]["name"],
-        arrival_depot=city.DEPOT_BY_NODE[parts["to_depot"][-1]]["name"],
+        departure_depot_id=depots_by_node[parts["to_pickup"][0]]["id"],
+        arrival_depot_id=depots_by_node[parts["to_depot"][-1]]["id"],
+        depot=depots_by_node[parts["to_pickup"][0]]["name"],
+        arrival_depot=depots_by_node[parts["to_depot"][-1]]["name"],
         origin=parts["customer_ride"][0],
         destination=parts["customer_ride"][-1],
         planned_legs=parts,
@@ -81,6 +98,7 @@ async def snapshot(conn, user, plans=False):
         WHERE v.user_id=$1 AND v.retired_at IS NULL ORDER BY t.vehicle_id,t.created_at DESC""",
         user,
     )
+    depots_by_node = {d["node"]: d for d in await list_depots(conn)} if plans else {}
     trips = []
     for row in rows:
         trip = dict(
@@ -92,7 +110,7 @@ async def snapshot(conn, user, plans=False):
         )
         if plans:
             trip.update(
-                trip_payload(row),
+                trip_payload(row, depots_by_node),
                 phase=row["phase"],
                 completed=row["completed_at"] is not None,
                 motion=json.loads(row["motion"]) if row["motion"] else None,
@@ -106,6 +124,7 @@ async def snapshot(conn, user, plans=False):
     )
     return dict(
         vehicles=[dict(v) for v in cars],
+        parked_counts=await parked_counts(conn, user),
         trips=trips,
         alerts=[dict(a) for a in alerts],
         limit=city.LIMIT,
@@ -150,9 +169,10 @@ async def resize(setup: Setup, request: Request, user: UUID = Depends(owner)):
                 user,
             )
             counts = Counter(v["parked_depot_id"] for v in cars if v["parked_depot_id"] is not None)
+            depot_ids = [d["id"] for d in await list_depots(conn)]
             additions = []
             for number in range(maximum + 1, maximum + difference + 1):
-                depot = min(DEPOTS, key=lambda d: counts[d])
+                depot = min(depot_ids, key=lambda d: counts[d])
                 counts[depot] += 1
                 additions.append((user, number, depot))
             await conn.executemany(
@@ -180,12 +200,15 @@ async def dispatch(
             JOIN cab_watch_accounts.vehicles v ON v.id=t.vehicle_id WHERE t.id=$1""",
             trip_id,
         )
+        depots = await list_depots(conn)
+        depots_by_node = {d["node"]: d for d in depots}
         if existing:
             if existing["user_id"] != user:
                 raise HTTPException(409, "Trip ID unavailable.")
-            payload = trip_payload(existing)
+            payload = trip_payload(existing, depots_by_node)
             if (payload["origin"], payload["destination"]) != (setup.pickup, setup.dropoff):
                 raise HTTPException(409, "Trip ID unavailable.")
+            payload["parked_counts"] = await parked_counts(conn, user)
             return payload
         cars = await vehicles(conn, user)
         idle = [v for v in cars if v["status"] == "available"]
@@ -199,7 +222,7 @@ async def dispatch(
             ),
         )
         arrival = min(
-            city.DEPOTS, key=lambda d: city.shortest_route(setup.dropoff, d["node"])[1]
+            depots, key=lambda d: city.shortest_route(setup.dropoff, d["node"])[1]
         )
         legs = {
             "to_pickup": city.shortest_route(car["current_node"], setup.pickup)[0],
@@ -217,4 +240,6 @@ async def dispatch(
             "UPDATE cab_watch_accounts.vehicles SET status='busy',parked_depot_id=NULL WHERE id=$1",
             car["id"],
         )
-        return trip_payload(dict(row, cab_number=car["cab"]))
+        payload = trip_payload(dict(row, cab_number=car["cab"]), depots_by_node)
+        payload["parked_counts"] = await parked_counts(conn, user)
+        return payload
