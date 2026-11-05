@@ -32,8 +32,8 @@ test('a wandering cab passes successive side-road junctions and rejoins at C',()
   until(cab,()=>cab.mode==='arrived');
 });
 
-test('recovery from midway along EF follows roads to the cheaper endpoint',()=>{
-  for(const [steps,junction] of [[2,'A'],[12,'C']]){
+test('recovery minimizes the full remaining journey and rejoins sooner on a tie',()=>{
+  for(const [steps,junction] of [[0,'A'],[2,'C'],[12,'C']]){
     const cab=trip();
     divert(cab);
     until(cab,()=>cab.from==='E');
@@ -45,6 +45,44 @@ test('recovery from midway along EF follows roads to the cheaper endpoint',()=>{
     until(cab,()=>cab.mode==='route');
     assert.deepEqual(cab.point,nodes[junction]);
   }
+});
+
+// Real Harbour City coordinates: N-H is shorter than N-M, but the complete
+// remaining passenger journey N-M-L is shorter than N-H-M-L.
+const harbour = {nodes:{H:[338,195], M:[260,288], L:[96,305], N:[472,275]},
+  roads:['HN','HM','MN','LM']};
+function harbourDetour(point) {
+  const cab=makeCab({planned_legs:{to_pickup:['H'],customer_ride:['H','M','L'],to_depot:['L']}},harbour);
+  Object.assign(cab,{mode:'detour',from:'H',to:'N',point:[...point]});
+  return cab;
+}
+
+test('at N, return chooses M instead of backtracking through H',()=>{
+  const cab=harbourDetour(harbour.nodes.N);
+  rejoin(cab);
+  assert.deepEqual(cab.recovery,['N','M']);
+  until(cab,()=>cab.mode==='route');
+  assert.deepEqual(cab.point,harbour.nodes.M);
+  until(cab,()=>cab.mode==='arrived');
+  assert.deepEqual(cab.point,harbour.nodes.L);
+});
+
+test('near H, turning back to H is still cheaper for the remaining trip',()=>{
+  const point=harbour.nodes.H.map((v,i)=>v+.1*(harbour.nodes.N[i]-v));
+  const cab=harbourDetour(point);
+  rejoin(cab);
+  assert.deepEqual(cab.point,point);
+  assert.deepEqual(cab.recovery,['H']);
+});
+
+test('between H and N, choose the cheaper full journey without teleporting',()=>{
+  const point=harbour.nodes.H.map((v,i)=>v+.9*(harbour.nodes.N[i]-v));
+  const cab=harbourDetour(point);
+  rejoin(cab);
+  assert.deepEqual(cab.point,point);
+  assert.deepEqual(cab.recovery,['N','M']);
+  advance(cab);
+  assert.ok(cab.point[0]>point[0]);
 });
 
 test('a dispatched car visits pickup, drop-off, and returns to its depot',()=>{
