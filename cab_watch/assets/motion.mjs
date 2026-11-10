@@ -1,16 +1,10 @@
 const distance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 
 export function makeCab(trip, network) {
-  const legs = trip.planned_legs ? ["to_pickup","customer_ride","to_depot"].map(name => {
-    const stops = trip.planned_legs[name];
-    return {stops, path:stops.map(node => network.nodes[node])};
-  }) : trip.route ? [{stops:trip.route, path:trip.route.map(n=>network.nodes[n])}] : trip.legs || [{stops:trip.stops, path:trip.path}];
-  const point = [...legs[0].path[0]];
-  const cab = {...trip, legs, fullStops:trip.stops, stops:legs[0].stops,
-    nodes:legs[0].path, leg:0, index:0, point, mode:'route', sequence:0,
-    streak:0, offset:0, confirmed:0, trail:[point], network};
-  while (cab.stops.length === 1 && cab.leg < legs.length - 1) nextLeg(cab);
-  return cab;
+  const nodes = trip.route.map(node => network.nodes[node]);
+  const point = [...nodes[0]];
+  return {...trip, nodes, index:0, point, mode:'route', sequence:0,
+    offset:0, confirmed:0, network};
 }
 
 function neighbours(network, node) {
@@ -21,32 +15,20 @@ function pick(choices) {
   return choices[Math.floor(Math.random() * choices.length)];
 }
 
-function nextLeg(cab) {
-  cab.leg++;
-  cab.stops = cab.legs[cab.leg].stops;
-  cab.nodes = cab.legs[cab.leg].path;
-  cab.index = 0;
-  cab.mode = 'route';
-}
-
 function resumeAt(cab, node) {
-  cab.index = cab.stops.indexOf(node);
-  cab.mode = 'route';
-  while (cab.index === cab.stops.length - 1 && cab.leg < cab.legs.length - 1) {
-    nextLeg(cab);
-  }
-  if (cab.index === cab.stops.length - 1) cab.mode = 'arrived';
+  cab.index = cab.route.indexOf(node);
+  cab.mode = cab.index === cab.route.length - 1 ? 'arrived' : 'route';
 }
 
 export function divert(cab) {
-  if (cab.mode !== 'route' || (cab.legs.length > 1 && cab.leg !== 1)) return;
-  if (cab.index + 1 < cab.stops.length - 1) cab.mode = 'turn requested';
+  if (cab.mode !== 'route') return;
+  if (cab.index + 1 < cab.route.length - 1) cab.mode = 'turn requested';
 }
 
 function takeQueuedTurn(cab) {
-  const node = cab.stops[cab.index];
+  const node = cab.route[cab.index];
   const exits = neighbours(cab.network,node).filter(n =>
-    n !== cab.stops[cab.index-1] && n !== cab.stops[cab.index+1]);
+    n !== cab.route[cab.index-1] && n !== cab.route[cab.index+1]);
   if (!exits.length) { divert(cab); return; }
   cab.from = node;
   cab.to = pick(exits);
@@ -54,14 +36,14 @@ function takeQueuedTurn(cab) {
 }
 
 // Start Dijkstra at the current point on the road. Score each possible rejoin
-// by connector distance PLUS the remaining planned leg, not proximity alone.
+// by connector distance PLUS the remaining planned route, not proximity alone.
 function recoveryPath(cab) {
   const {nodes} = cab.network;
   const remaining = new Map();
   let suffix = 0;
-  for (let i=cab.stops.length-1;i>=0;i--) {
-    if (i<cab.stops.length-1) suffix += distance(nodes[cab.stops[i]],nodes[cab.stops[i+1]]);
-    remaining.set(cab.stops[i],suffix);
+  for (let i=cab.route.length-1;i>=0;i--) {
+    if (i<cab.route.length-1) suffix += distance(nodes[cab.route[i]],nodes[cab.route[i+1]]);
+    remaining.set(cab.route[i],suffix);
   }
   const costs = new Map();
   const parent = new Map();
@@ -118,7 +100,7 @@ export function rejoin(cab) {
 export function advance(cab) {
   if (cab.mode === 'arrived') return false;
   const onRoute = cab.mode === 'route' || cab.mode === 'turn requested';
-  const next = onRoute ? cab.stops[cab.index + 1] :
+  const next = onRoute ? cab.route[cab.index + 1] :
     cab.mode === 'returning' ? cab.recovery[0] : cab.to;
   const target = cab.network.nodes[next];
   const remaining = distance(cab.point, target);
@@ -128,17 +110,16 @@ export function advance(cab) {
     cab.point = [...target];
     if (onRoute) {
       const queued = cab.mode === 'turn requested';
-      const leg = cab.leg;
       resumeAt(cab, next);
-      if (queued && cab.leg === leg && cab.mode === 'route') takeQueuedTurn(cab);
+      if (queued && cab.mode === 'route') takeQueuedTurn(cab);
     } else if (cab.mode === 'returning' && cab.recovery.length === 1) {
       resumeAt(cab, next);
     } else if (cab.mode === 'returning') {
       cab.recovery.shift();
     } else {
       const exits = neighbours(cab.network, next).filter(n => n !== cab.from);
-      const sideRoads = exits.filter(n => !cab.stops.some((v,i) => i>0 &&
-        ((v===n && cab.stops[i-1]===next) || (v===next && cab.stops[i-1]===n))));
+      const sideRoads = exits.filter(n => !cab.route.some((v,i) => i>0 &&
+        ((v===n && cab.route[i-1]===next) || (v===next && cab.route[i-1]===n))));
       cab.to = sideRoads.length ? pick(sideRoads) : exits.length ? pick(exits) : cab.from;
       cab.from = next;
     }

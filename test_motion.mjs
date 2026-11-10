@@ -7,7 +7,7 @@ const nodes = {P:[-80,0], A:[0,0], B:[100,0], C:[200,0], D:[300,0], E:[0,100], F
 const network = {nodes, roads:['PA','AB','BC','CD','AE','EF','FC']};
 const stops = ['P','A','B','C','D'];
 function trip() {
-  return makeCab({stops, path:stops.map(n=>nodes[n])}, network);
+  return makeCab({route:stops}, network);
 }
 function until(cab, condition) {
   for (let i=0;i<100 && !condition();i++) advance(cab);
@@ -52,7 +52,7 @@ test('recovery minimizes the full remaining journey and rejoins sooner on a tie'
 const harbour = {nodes:{H:[338,195], M:[260,288], L:[96,305], N:[472,275]},
   roads:['HN','HM','MN','LM']};
 function harbourDetour(point) {
-  const cab=makeCab({planned_legs:{to_pickup:['H'],customer_ride:['H','M','L'],to_depot:['L']}},harbour);
+  const cab=makeCab({route:['H','M','L']},harbour);
   Object.assign(cab,{mode:'detour',from:'H',to:'N',point:[...point]});
   return cab;
 }
@@ -84,48 +84,6 @@ test('between H and N, choose the cheaper full journey without teleporting',()=>
   advance(cab);
   assert.ok(cab.point[0]>point[0]);
 });
-
-test('a dispatched car visits pickup, drop-off, and returns to its depot',()=>{
-  const legs=[
-    {stops:['A','B'],path:[nodes.A,nodes.B]},
-    {stops:['B','C'],path:[nodes.B,nodes.C]},
-    {stops:['C','B','A'],path:[nodes.C,nodes.B,nodes.A]},
-  ];
-  const cab=makeCab({legs,stops:['A','B','C','B','A'],path:[nodes.A,nodes.B,nodes.C,nodes.B,nodes.A]},network);
-  assert.equal(cab.leg,0);
-  until(cab,()=>cab.leg===1);
-  assert.deepEqual(cab.point,nodes.B);
-  until(cab,()=>cab.leg===2);
-  assert.deepEqual(cab.point,nodes.C);
-  until(cab,()=>cab.mode==='arrived');
-  assert.equal(cab.leg,2);
-  assert.deepEqual(cab.point,nodes.A);
-});
-
-test('pickup at the depot skips the empty first leg',()=>{
-  const legs=[
-    {stops:['A'],path:[nodes.A]},
-    {stops:['A','B'],path:[nodes.A,nodes.B]},
-    {stops:['B','A'],path:[nodes.B,nodes.A]},
-  ];
-  const cab=makeCab({legs,stops:['A','B','A'],path:[nodes.A,nodes.B,nodes.A]},network);
-  assert.equal(cab.leg,1);
-  until(cab,()=>cab.mode==='arrived');
-  assert.equal(cab.leg,2);
-});
-
-test('drop-off at the home depot completes the empty return leg',()=>{
-  const legs=[
-    {stops:['A','B'],path:[nodes.A,nodes.B]},
-    {stops:['B','A'],path:[nodes.B,nodes.A]},
-    {stops:['A'],path:[nodes.A]},
-  ];
-  const cab=makeCab({legs,stops:['A','B','A'],path:[nodes.A,nodes.B,nodes.A]},network);
-  until(cab,()=>cab.mode==='arrived');
-  assert.equal(cab.leg,2);
-  assert.deepEqual(cab.point,nodes.A);
-});
-
 
 test('direct ride starts at pickup and stops on the final junction',()=>{
   const cab=makeCab({route:['A','B','C']},network);
