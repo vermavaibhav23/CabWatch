@@ -1,5 +1,5 @@
 import {TelemetryOutbox,retryDelay} from './telemetry.mjs?v=route2';
-import {makeCab,divert,rejoin,advance} from './motion.mjs?v=route2';
+import {makeCab,motionSnapshot,divert,rejoin,advance} from './motion.mjs?v=motion3';
 import {cityMap,makeLayers,drawSharedRoads,selectMap,showPoint,animate} from './map.mjs?v=route2';
 
 const $=id=>document.getElementById(id);
@@ -98,7 +98,7 @@ async function explain(a){
 function draw(now){if(fleet&&animate(fleet.cabs,now))frame=requestAnimationFrame(draw);}
 function gps(f,c){
   return {trip_id:c.id,sequence:c.sequence,captured_at:c.capturedAt,
-    motion:{mode:c.mode,index:c.index,source:c.from,target:c.to,recovery:[...(c.recovery||[])]},
+    motion:motionSnapshot(c),
     lat:f.origin[0]-c.point[1]*f.metres/f.lat_scale,
     lon:f.origin[1]+c.point[0]*f.metres/f.lon_scale};
 }
@@ -225,10 +225,6 @@ function restoreTrip(trip){
   c.confirmed=c.sequence=trip.last_sequence;c.offset=trip.distance_m;
   if(trip.lat!==null)c.point=[(trip.lon-fleet.origin[1])*fleet.lon_scale/fleet.metres,
     (fleet.origin[0]-trip.lat)*fleet.lat_scale/fleet.metres];
-  if(trip.motion){
-    c.mode=trip.motion.mode;c.index=trip.motion.index;
-    c.from=trip.motion.source;c.to=trip.motion.target;c.recovery=trip.motion.recovery;
-  }
   if(trip.completed)c.mode='arrived';
   fleet.cabs.push(c);makeLayers([c],select);showPoint(c,c.point);
   showCabInRoster(c);

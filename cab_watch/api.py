@@ -27,12 +27,27 @@ router.include_router(fleet_router)
 
 Node = Annotated[str, Field(pattern="^[A-Z]$")]
 
-class Motion(BaseModel):
+class RouteMotion(BaseModel):
+    mode: Literal["route", "turn requested"]
     index: int = Field(ge=0, le=25)
-    mode: Literal["route","turn requested","detour","returning","arrived"]
-    source: Node | None = None
-    target: Node | None = None
-    recovery: list[Node] = Field(default_factory=list, max_length=26)
+
+
+class DetourMotion(BaseModel):
+    mode: Literal["detour"]
+    source: Node
+    target: Node
+
+
+class ReturnMotion(BaseModel):
+    mode: Literal["returning"]
+    recovery: list[Node] = Field(min_length=1, max_length=26)
+
+
+class ArrivedMotion(BaseModel):
+    mode: Literal["arrived"]
+
+
+Motion = Annotated[RouteMotion | DetourMotion | ReturnMotion | ArrivedMotion, Field(discriminator="mode")]
 
 
 class Point(BaseModel, extra="forbid"):

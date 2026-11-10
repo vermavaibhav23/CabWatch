@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {makeCab, divert, advance, rejoin} from './cab_watch/assets/motion.mjs';
+import {makeCab, motionSnapshot, divert, advance, rejoin} from './cab_watch/assets/motion.mjs';
 
 // A---B---C---D is the plan. A---E---F---C is a longer side road.
 const nodes = {P:[-80,0], A:[0,0], B:[100,0], C:[200,0], D:[300,0], E:[0,100], F:[200,100]};
@@ -91,4 +91,26 @@ test('direct ride starts at pickup and stops on the final junction',()=>{
   until(cab,()=>cab.mode==='arrived');
   assert.deepEqual(cab.point,nodes.C);
   assert.equal(advance(cab),false);
+});
+
+test('each mode saves just what the next movement needs after reload',()=>{
+  const route = ['P','A','B','C','D'];
+  const cases = [
+    [{mode:'route',index:1},[30,0]],
+    [{mode:'turn requested',index:1},[30,0]],
+    [{mode:'detour',source:'A',target:'E'},[0,30]],
+    [{mode:'returning',recovery:['F','C']},[80,100]],
+    [{mode:'arrived'},nodes.D]
+  ];
+  for(const [motion,point] of cases){
+    const old={index:1,source:'A',target:'E',recovery:['F','C'],...motion};
+    const original=makeCab({route,motion:old},network);
+    const saved=motionSnapshot(original);
+    assert.deepEqual(saved,motion);
+    const resumed=makeCab({route,motion:saved},network);
+    for(const cab of [original,resumed]) cab.point=[...point];
+    assert.equal(advance(original),advance(resumed));
+    assert.deepEqual(original.point,resumed.point);
+    assert.deepEqual(motionSnapshot(original),motionSnapshot(resumed));
+  }
 });

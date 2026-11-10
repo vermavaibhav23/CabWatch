@@ -42,13 +42,20 @@ class AccountFlow(unittest.TestCase):
 
             def sample(seq, node, mode, owner=a):
                 lat, lon = city.gps(city.NODES[node])
+                motion = {"mode": mode}
+                if mode == "detour":
+                    motion.update(source="J" if node == "K" else "I", target=node)
+                elif mode == "route":
+                    motion["index"] = trip["route"].index(node)
                 return client.post("me/gps", headers=owner, json={"readings": [{
                     "trip_id":trip["id"], "sequence":seq, "lat":lat, "lon":lon,
-                    "motion":{"index":0,"mode":mode}}]})
+                    "motion":motion}]})
 
             self.assertEqual(sample(1,"G","route",b).status_code,422)
             self.assertIsNone(sample(1,"G","route").json()["results"][0]["alert"])
             self.assertEqual(sample(2,"D","detour").json()["results"][0]["alert"]["opened_sequence"],2)
+            checkpoint = client.get("me/trips", headers=a).json()["trips"][0]["motion"]
+            self.assertEqual(checkpoint, {"mode":"detour", "source":"I", "target":"D"})
             self.assertEqual(sample(3,"I","route").json()["results"][0]["alert"]["closed_sequence"],3)
             self.assertFalse(sample(4,"K","detour").json()["results"][0]["completed"])
             receipt = sample(5,"K","arrived").json()["results"][0]

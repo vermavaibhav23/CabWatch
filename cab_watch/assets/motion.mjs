@@ -3,8 +3,25 @@ const distance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 export function makeCab(trip, network) {
   const nodes = trip.route.map(node => network.nodes[node]);
   const point = [...nodes[0]];
-  return {...trip, nodes, index:0, point, mode:'route', sequence:0,
+  const motion = trip.motion;
+  return {...trip, nodes, point, mode:motion?.mode ?? 'route', index:motion?.index ?? 0,
+    from:motion?.source, to:motion?.target, recovery:motion?.recovery?.slice(), sequence:0,
     offset:0, confirmed:0, network};
+}
+
+export function motionSnapshot(cab) {
+  switch (cab.mode) {
+    case 'route':
+    case 'turn requested':
+      return {mode:cab.mode, index:cab.index};
+    case 'detour':
+      return {mode:cab.mode, source:cab.from, target:cab.to};
+    case 'returning':
+      return {mode:cab.mode, recovery:[...cab.recovery]};
+    case 'arrived':
+      return {mode:cab.mode};
+  }
+  throw new Error('Unknown cab movement: ' + cab.mode);
 }
 
 function neighbours(network, node) {
