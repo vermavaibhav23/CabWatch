@@ -53,6 +53,9 @@ class TripSchema(unittest.IsolatedAsyncioTestCase):
     async def test_fresh_schema_enforces_ownership_and_per_user_keys(self):
         await self.migrate()
         await self.seed()
+        self.assertEqual(self.cars, ['CB#001', 'CB#002', 'CB#003'])
+        await self.sql("SELECT setval('cab_watch_accounts.cb_plate_serial', 999)")
+        self.assertEqual((await self.sql('SELECT cab_watch_accounts.next_plate() AS id'))[0]['id'], 'CB#1000')
         key = uuid4()
         trip = (await self.insert_trip(self.a, key, self.cars[0]))[0]['id']
         with self.assertRaises(asyncpg.UniqueViolationError):

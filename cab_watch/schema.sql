@@ -12,18 +12,14 @@ CREATE TABLE IF NOT EXISTS cab_watch_accounts.depots (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL, node text NOT NULL UNIQUE
 );
 -- A single sequence supplies synthetic plates across all accounts and retired cabs.
-CREATE SEQUENCE IF NOT EXISTS cab_watch_accounts.plate_serial
-    MINVALUE 1 MAXVALUE 669173076 START WITH 11233 NO CYCLE;
+CREATE SEQUENCE IF NOT EXISTS cab_watch_accounts.cb_plate_serial START WITH 1 NO CYCLE;
 CREATE OR REPLACE FUNCTION cab_watch_accounts.next_plate() RETURNS text
 LANGUAGE sql VOLATILE AS $$
-    SELECT 'KA' || lpad((1+n/(676*9999))::text,2,'0')
-           || chr(65+(n/9999/26)%26) || chr(65+(n/9999)%26)
-           || lpad((1+n%9999)::text,4,'0')
-    FROM (SELECT nextval('cab_watch_accounts.plate_serial')::integer-1 AS n) serial
+    SELECT 'CB#' || lpad(digits, greatest(3, length(digits)), '0')
+    FROM (SELECT nextval('cab_watch_accounts.cb_plate_serial')::text AS digits) serial
 $$;
 CREATE TABLE IF NOT EXISTS cab_watch_accounts.vehicles (
-    id text PRIMARY KEY DEFAULT cab_watch_accounts.next_plate()
-        CONSTRAINT vehicle_plate_format CHECK(id ~ '^[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{4}$'),
+    id text PRIMARY KEY DEFAULT cab_watch_accounts.next_plate(),
     user_id uuid NOT NULL REFERENCES cab_watch_accounts.users,
     cab_number integer NOT NULL CHECK(cab_number>0),
     parked_depot_id uuid REFERENCES cab_watch_accounts.depots,
@@ -75,8 +71,13 @@ BEGIN
             FOREIGN KEY(vehicle_id) REFERENCES cab_watch_accounts.vehicles(id) ON UPDATE CASCADE;
         ALTER TABLE cab_watch_accounts.vehicles ALTER COLUMN id SET DEFAULT cab_watch_accounts.next_plate();
         UPDATE cab_watch_accounts.vehicles SET id=DEFAULT;
-        ALTER TABLE cab_watch_accounts.vehicles ADD CONSTRAINT vehicle_plate_format
-            CHECK(id ~ '^[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{4}$');
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_constraint WHERE conrelid='cab_watch_accounts.vehicles'::regclass
+                   AND conname='vehicle_plate_format_cb') THEN
+        ALTER TABLE cab_watch_accounts.vehicles DROP CONSTRAINT IF EXISTS vehicle_plate_format;
+        -- Existing plates stay valid so saved trips keep their vehicle identity.
+        ALTER TABLE cab_watch_accounts.vehicles ADD CONSTRAINT vehicle_plate_format_cb
+            CHECK(id ~ '^(CB#[0-9]{3,}|[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{4})$');
     END IF;
 END $$;
 -- Validate route structure before discarding the redundant endpoint columns.
