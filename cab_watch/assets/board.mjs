@@ -1,5 +1,5 @@
 import {TelemetryOutbox,retryDelay} from './telemetry.mjs?v=route2';
-import {makeCab,motionSnapshot,divert,rejoin,advance} from './motion.mjs?v=junction1';
+import {makeCab,motionSnapshot,divert,rejoin,advance} from './motion.mjs?v=retrace1';
 import {cityMap,makeLayers,drawSharedRoads,selectMap,showPoint,animate} from './map.mjs?v=route2';
 
 const $=id=>document.getElementById(id);
@@ -282,7 +282,7 @@ $('play').onclick=()=>{if(!fleet)return;running=!running;fleet.failed=false;rend
 $('wrong').onclick=()=>{divert(chosen());render();
   msg(running?'Turn queued for the next junction.':'Turn queued for the next junction. Press Start to drive.');};
 $('return').onclick=()=>{rejoin(chosen());render();
-  msg(running?'Cab is rejoining its planned route.':'Return requested. Press Start to drive.');};
+  msg(running?'Cab is retracing its detour.':'Return requested. Press Start to drive.');};
 let registering=false;
 function signOut(message=''){
   sessionStorage.removeItem('cabwatch.token');sessionStorage.removeItem('cabwatch.name');

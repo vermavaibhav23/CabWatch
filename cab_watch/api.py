@@ -8,7 +8,7 @@ from typing import Literal, Annotated
 import httpx
 from fastapi import Depends, APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
-from pydantic import AwareDatetime, BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
 from .agent import generate, tool
 from .admission import TelemetryAdmission
@@ -34,13 +34,20 @@ class RouteMotion(BaseModel):
 
 class DetourMotion(BaseModel):
     mode: Literal["detour"]
-    source: Node
+    trail: list[Node] = Field(min_length=1)
     target: Node
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_previous_checkpoint(cls, value):
+        if isinstance(value, dict) and "trail" not in value and "source" in value:
+            return {**value, "trail": [value["source"]]}
+        return value
 
 
 class ReturnMotion(BaseModel):
     mode: Literal["returning"]
-    recovery: list[Node] = Field(min_length=1, max_length=26)
+    recovery: list[Node] = Field(min_length=1)
 
 
 class ArrivedMotion(BaseModel):
