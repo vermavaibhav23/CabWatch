@@ -6,7 +6,7 @@ CabWatch is a simulated fleet dispatch and route-monitoring dashboard built with
 
 Sign in, choose **Add trip**, then select a pickup and drop-off on the map. FastAPI assigns a simulated plate and finds the shortest road route with Dijkstra. The cab appears at pickup, starts moving, and finishes at drop-off. Each simultaneous ride gets its own cab. An idle cab can be reused for a later trip.
 
-**Change route** queues a turn at the next eligible junction. **Return to route** chooses a road back to the planned path that minimizes the remaining journey. Refreshing the dashboard restores saved trips and alerts. Press **Start** to resume.
+**Change route** queues a random turn at the next junction. The cab can take any connected road except the planned next road when an alternative exists, including turning back at a junction. **Return to route** cancels a queued turn. During a detour, it plans from the junction ahead and finishes the current road before following the recovery path. If the cab is already at a junction, planning starts there. It chooses the rejoin point with the shortest total distance left to drop-off. Refreshing the dashboard restores saved trips and alerts. Press **Start** to resume.
 
 ## One GPS reading
 

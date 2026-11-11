@@ -1,5 +1,5 @@
 import {TelemetryOutbox,retryDelay} from './telemetry.mjs?v=route2';
-import {makeCab,motionSnapshot,divert,rejoin,advance} from './motion.mjs?v=motion3';
+import {makeCab,motionSnapshot,divert,rejoin,advance} from './motion.mjs?v=junction1';
 import {cityMap,makeLayers,drawSharedRoads,selectMap,showPoint,animate} from './map.mjs?v=route2';
 
 const $=id=>document.getElementById(id);

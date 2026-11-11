@@ -14,7 +14,8 @@ function until(cab, condition) {
   assert.ok(condition());
 }
 
-test('a wandering cab passes successive side-road junctions and rejoins at C',()=>{
+test('a wandering cab passes successive side-road junctions and rejoins at C',t=>{
+  t.mock.method(Math,'random',()=>0.99);
   const cab=trip();
   advance(cab);
   divert(cab);
@@ -32,7 +33,8 @@ test('a wandering cab passes successive side-road junctions and rejoins at C',()
   until(cab,()=>cab.mode==='arrived');
 });
 
-test('recovery minimizes the full remaining journey and rejoins sooner on a tie',()=>{
+test('recovery minimizes the full remaining journey and rejoins sooner on a tie',t=>{
+  t.mock.method(Math,'random',()=>0.99);
   for(const [steps,junction] of [[0,'A'],[2,'C'],[12,'C']]){
     const cab=trip();
     divert(cab);
@@ -67,12 +69,14 @@ test('at N, return chooses M instead of backtracking through H',()=>{
   assert.deepEqual(cab.point,harbour.nodes.L);
 });
 
-test('near H, turning back to H is still cheaper for the remaining trip',()=>{
+test('even just past H, finish H-N before recovering',()=>{
   const point=harbour.nodes.H.map((v,i)=>v+.1*(harbour.nodes.N[i]-v));
   const cab=harbourDetour(point);
   rejoin(cab);
   assert.deepEqual(cab.point,point);
-  assert.deepEqual(cab.recovery,['H']);
+  assert.deepEqual(cab.recovery,['N','M']);
+  advance(cab);
+  assert.ok(cab.point[0]>point[0]);
 });
 
 test('between H and N, choose the cheaper full journey without teleporting',()=>{
@@ -83,6 +87,34 @@ test('between H and N, choose the cheaper full journey without teleporting',()=>
   assert.deepEqual(cab.recovery,['N','M']);
   advance(cab);
   assert.ok(cab.point[0]>point[0]);
+});
+
+test('a detour can turn back but never picks the planned next road when another exists',t=>{
+  const random=t.mock.method(Math,'random',()=>0);
+  for(const [fraction,expected] of [[0,'P'],[0.99,'E']]){
+    random.mock.mockImplementation(()=>fraction);
+    const cab=trip();
+    divert(cab);
+    until(cab,()=>cab.mode==='detour');
+    assert.equal(cab.from,'A');
+    assert.equal(cab.to,expected);
+  }
+});
+
+test('return at a junction uses that junction, even after a random exit was selected',()=>{
+  const cab=harbourDetour(harbour.nodes.N);
+  Object.assign(cab,{from:'N',to:'H'});
+  rejoin(cab);
+  assert.deepEqual(cab.recovery,['N','M']);
+});
+
+test('return before the queued turn keeps the original route',()=>{
+  const cab=trip();
+  divert(cab);
+  rejoin(cab);
+  assert.equal(cab.mode,'route');
+  until(cab,()=>cab.mode==='arrived');
+  assert.deepEqual(cab.point,nodes.D);
 });
 
 test('direct ride starts at pickup and stops on the final junction',()=>{

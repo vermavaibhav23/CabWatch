@@ -42,19 +42,18 @@ export function divert(cab) {
   if (cab.index + 1 < cab.route.length - 1) cab.mode = 'turn requested';
 }
 
-function takeQueuedTurn(cab) {
-  const node = cab.route[cab.index];
-  const exits = neighbours(cab.network,node).filter(n =>
-    n !== cab.route[cab.index-1] && n !== cab.route[cab.index+1]);
-  if (!exits.length) { divert(cab); return; }
+function chooseDetourRoad(cab, node) {
+  const index = cab.route.indexOf(node);
+  const plannedNext = index < 0 ? undefined : cab.route[index + 1];
+  const roads = neighbours(cab.network, node);
+  const alternatives = roads.filter(next => next !== plannedNext);
   cab.from = node;
-  cab.to = pick(exits);
+  cab.to = pick(alternatives.length ? alternatives : roads);
   cab.mode = 'detour';
 }
 
-// Start Dijkstra at the current point on the road. Score each possible rejoin
-// by connector distance PLUS the remaining planned route, not proximity alone.
-function recoveryPath(cab) {
+// From a junction, minimize the road distance to rejoin plus the route left to drive.
+function recoveryPath(cab, start) {
   const {nodes} = cab.network;
   const remaining = new Map();
   let suffix = 0;
@@ -62,13 +61,12 @@ function recoveryPath(cab) {
     if (i<cab.route.length-1) suffix += distance(nodes[cab.route[i]],nodes[cab.route[i+1]]);
     remaining.set(cab.route[i],suffix);
   }
-  const costs = new Map();
+  const costs = new Map([[start, 0]]);
   const parent = new Map();
-  const open = new Set([cab.from, cab.to]);
+  const open = new Set([start]);
   const settled = new Set();
   let best, bestTotal = Infinity, bestConnector = Infinity;
   const epsilon = 1e-8;
-  for (const end of open) costs.set(end, distance(cab.point, nodes[end]));
   while (open.size) {
     let node;
     for (const candidate of open) {
@@ -109,7 +107,9 @@ export function rejoin(cab) {
   if (cab.mode === 'turn requested') {
     cab.mode = 'route';
   } else if (cab.mode === 'detour') {
-    cab.recovery = recoveryPath(cab);
+    // At a junction we can choose now. Once on a road, finish it first.
+    const atSource = distance(cab.point, cab.network.nodes[cab.from]) < 1e-8;
+    cab.recovery = recoveryPath(cab, atSource ? cab.from : cab.to);
     cab.mode = 'returning';
   }
 }
@@ -128,17 +128,13 @@ export function advance(cab) {
     if (onRoute) {
       const queued = cab.mode === 'turn requested';
       resumeAt(cab, next);
-      if (queued && cab.mode === 'route') takeQueuedTurn(cab);
+      if (queued && cab.mode === 'route') chooseDetourRoad(cab, next);
     } else if (cab.mode === 'returning' && cab.recovery.length === 1) {
       resumeAt(cab, next);
     } else if (cab.mode === 'returning') {
       cab.recovery.shift();
     } else {
-      const exits = neighbours(cab.network, next).filter(n => n !== cab.from);
-      const sideRoads = exits.filter(n => !cab.route.some((v,i) => i>0 &&
-        ((v===n && cab.route[i-1]===next) || (v===next && cab.route[i-1]===n))));
-      cab.to = sideRoads.length ? pick(sideRoads) : exits.length ? pick(exits) : cab.from;
-      cab.from = next;
+      chooseDetourRoad(cab, next);
     }
   }
   cab.sequence++;
