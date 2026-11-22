@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 import unittest
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import asyncpg
 from cab_watch.api import apply_schema
@@ -94,7 +94,7 @@ class TripSchema(unittest.IsolatedAsyncioTestCase):
         after = await self.sql('SELECT * FROM cab_watch_accounts.trips ORDER BY id')
         tables = await self.sql("""SELECT table_name FROM information_schema.tables
             WHERE table_schema='cab_watch_accounts' AND table_type='BASE TABLE'""")
-        self.assertEqual({r['table_name'] for r in tables}, {'users','vehicles','trips','alerts'})
+        self.assertEqual({r['table_name'] for r in tables}, {'users','vehicles','trips','alerts','telemetry_history'})
         for original, updated in zip(before, after):
             for column in set(original.keys()) - {'motion','planned_legs','distance_m','phase'}:
                 self.assertEqual(original[column], updated[column])
@@ -104,7 +104,8 @@ class TripSchema(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(updated['idempotency_key'])
         mapped = next(r for r in after if r['id'] == trip)
         self.assertEqual(mapped['idempotency_key'], key)
-        self.assertEqual(alerts, await self.sql('SELECT * FROM cab_watch_accounts.alerts'))
+        for old, new in zip(alerts, await self.sql('SELECT * FROM cab_watch_accounts.alerts')):
+            self.assertEqual(dict(old), {k:new[k] for k in old.keys()})
         self.assertIsNone((await self.sql("SELECT to_regclass('cab_watch_accounts.dispatch_requests') AS table_name"))[0]['table_name'])
         await self.migrate()
         self.assertEqual(after, await self.sql('SELECT * FROM cab_watch_accounts.trips ORDER BY id'))
@@ -150,3 +151,29 @@ class TripSchema(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]['request_key'], key)
         self.assertEqual(rows[0]['trip_id'], tid)
         self.assertNotIn('user_id', (await self.sql('SELECT * FROM cab_watch_accounts.trips'))[0].keys())
+
+    async def test_event_replay_does_not_close_a_newer_incident(self):
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+        from cab_watch.stream import Stream
+        await self.migrate()
+        await self.seed()
+        tid=(await self.insert_trip(self.a,uuid4(),self.cars[0]))[0]['id']
+        await self.sql("INSERT INTO cab_watch_accounts.alerts(trip_id,opened_sequence,peak_metres) VALUES($1,15,250)",tid)
+        writer=object.__new__(Stream)
+        conn=SimpleNamespace(execute=self.sql)
+        reset=dict(kind='reset',trip_id=str(tid),sequence=17)
+        await writer.persist_event(conn,reset)
+        now=datetime.now(timezone.utc).isoformat()
+        alert=dict(id=str(uuid4()),trip_id=str(tid),opened_sequence=20,closed_sequence=None,peak_metres=300,opened_at=now,resolved_at=None)
+        await writer.persist_event(conn,dict(kind='alert',alert=alert))
+        # Crash after SQL commit but before Redis ACK can replay earlier events.
+        await writer.persist_event(conn,reset)
+        await writer.persist_event(conn,dict(kind='alert',alert=alert))
+        rows=await self.sql('SELECT * FROM cab_watch_accounts.alerts WHERE event_key=$1',UUID(alert['id']))
+        self.assertIsNone(rows[0]['closed_sequence'])
+        closed={**alert,'closed_sequence':21,'resolved_at':now,'close_reason':'returned to route'}
+        await writer.persist_event(conn,dict(kind='alert',alert=closed))
+        await writer.persist_event(conn,dict(kind='alert',alert=alert))
+        rows=await self.sql('SELECT * FROM cab_watch_accounts.alerts WHERE event_key=$1',UUID(alert['id']))
+        self.assertEqual(rows[0]['closed_sequence'],21)

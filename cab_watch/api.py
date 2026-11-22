@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import secrets
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from uuid import UUID
@@ -7,7 +9,7 @@ from typing import Literal, Annotated
 
 import httpx
 from fastapi import Depends, APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
 from .agent import generate, tool
@@ -117,6 +119,7 @@ async def apply_schema(conn, namespace="cab_watch_accounts"):
             CHECK ({namespace}.valid_route(planned_route))""")
 
     await conn.execute((ROOT / "normalize_trips.sql").read_text(encoding="utf-8").replace("cab_watch_accounts", namespace))
+    await conn.execute((ROOT / "kafka_schema.sql").read_text(encoding="utf-8").replace("cab_watch_accounts", namespace))
 
 
 @asynccontextmanager
@@ -153,10 +156,51 @@ async def ingest(batch: Batch, request: Request, user: UUID=Depends(owner)):
     async with request.app.state.telemetry_admission.slot(user):
         try:
             async with asyncio.timeout(10):
+                pipeline = getattr(request.app.state, "pipeline", None)
+                if pipeline:
+                    result = await pipeline.ingest(batch, user)
+                    return JSONResponse(result, status_code=202)
                 return await ingest_batch(batch, request.app.state.db, user)
         except TimeoutError:
             raise HTTPException(503, "Telemetry processing timed out. Retry this batch.",
                                 headers={"Retry-After": "1"}) from None
+        except HTTPException:
+            raise
+        except Exception:
+            if getattr(request.app.state, "pipeline", None):
+                raise HTTPException(503, "Telemetry not acknowledged. Retry the same trip/sequence batch.",
+                                    headers={"Retry-After": "2"}) from None
+            raise
+
+
+@router.get("/me/live")
+async def live(request: Request, user: UUID=Depends(owner)):
+    pipeline = getattr(request.app.state, "pipeline", None)
+    if not pipeline:
+        return {"enabled": False, "states": [], "alerts": []}
+    try:
+        return await pipeline.snapshot(user)
+    except Exception:
+        raise HTTPException(503, "Live tracking is delayed; state store unavailable") from None
+
+
+@router.get("/me/trips/{trip_id}/history")
+async def history(trip_id: UUID, request: Request, after: int=0, user: UUID=Depends(owner)):
+    db = request.app.state.db
+    if not await db.fetchval("SELECT 1 FROM cab_watch_accounts.trips WHERE id=$1 AND user_id=$2",trip_id,user):
+        raise HTTPException(404,"Unknown trip")
+    rows = await db.fetch("""SELECT sequence,captured_at,lat,lon,motion FROM cab_watch_accounts.telemetry_history
+        WHERE trip_id=$1 AND sequence>$2 ORDER BY sequence LIMIT 1000""",trip_id,max(0,after))
+    return {"readings":[dict(r) for r in rows]}
+
+
+@router.get("/metrics", include_in_schema=False)
+async def metrics(request: Request):
+    expected = os.getenv("METRICS_TOKEN")
+    if not expected or not secrets.compare_digest(request.headers.get("Authorization",""), "Bearer "+expected):
+        raise HTTPException(401,"Metrics credentials required")
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    return Response(generate_latest(),media_type=CONTENT_TYPE_LATEST)
 
 
 async def ingest_batch(batch, db, user):
@@ -179,21 +223,32 @@ async def ingest_batch(batch, db, user):
 
 
 @router.post("/me/alerts/{alert_id}/explain")
-async def explain(alert_id: int, request: Request,user: UUID=Depends(owner)):
+async def explain(alert_id: str, request: Request,user: UUID=Depends(owner)):
     db = request.app.state.db
-    alert = await db.fetchrow("""SELECT a.*,t.vehicle_id FROM cab_watch_accounts.alerts a
+    alert_id = str(alert_id)
+    try:
+        value = int(alert_id) if alert_id.isdecimal() else UUID(alert_id)
+        if isinstance(value, int) and value > 9223372036854775807:
+            raise ValueError("Alert ID exceeds bigint")
+    except ValueError:
+        raise HTTPException(404,"Unknown alert") from None
+    column = "a.id" if isinstance(value,int) else "a.event_key"
+    alert = await db.fetchrow(f"""SELECT a.*,t.vehicle_id FROM cab_watch_accounts.alerts a
         JOIN cab_watch_accounts.trips t ON t.id=a.trip_id
-        WHERE t.user_id=$1 AND a.id=$2""",user,alert_id)
+        WHERE t.user_id=$1 AND {column}=$2""",user,value)
+    if not alert and getattr(request.app.state,"pipeline",None):
+        view = await request.app.state.pipeline.snapshot(user)
+        alert = next((a for a in view["alerts"] if str(a["id"])==alert_id),None)
     if not alert:
         raise HTTPException(404, "Unknown alert for this simulation")
     facts = dict(vehicle_id=alert["vehicle_id"], threshold_m=city.LIMIT,
                  opened_sequence=alert["opened_sequence"], closed_sequence=alert["closed_sequence"],
                  status="resolved" if alert["closed_sequence"] is not None else "open",
-                 peak_m=round(alert["peak_metres"]))
+                 peak_m=round(alert["peak_metres"]), close_reason=alert.get("close_reason"))
     baseline = (f"{facts['vehicle_id']} triggered the {city.LIMIT} m off-route alert at GPS "
                 f"#{facts['opened_sequence']}. The maximum recorded offset was {facts['peak_m']} m.")
     if facts["closed_sequence"] is not None:
-        baseline += f" The alert cleared at GPS #{facts['closed_sequence']}."
+        baseline += f" Tracking status changed at GPS #{facts['closed_sequence']}: {facts['close_reason'] or 'returned to route'}."
     declarations = [tool("read_alert_evidence", "Read the measured offsets and status for this simulated alert.")]
     contents = [{"role":"user","parts":[{"text":"Call read_alert_evidence then explain the result to a dispatcher "
                 "in two short sentences. The peak is the maximum during the incident. Do not infer the opening distance. Never infer danger or a reason for the detour."}]}]

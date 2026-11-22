@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
@@ -108,9 +109,17 @@ async def owner(
     try:
         # Use the unverified subject only to look up the candidate verification key.
         subject = UUID(jwt.decode(token, options={"verify_signature": False})["sub"])
-        key = await request.app.state.db.fetchval(
-            "SELECT jwt_key FROM cab_watch_accounts.users WHERE id=$1", subject
-        )
+        pipeline = getattr(request.app.state,"pipeline",None)
+        cached = pipeline.key_cache.get(subject) if pipeline else None
+        key = cached[1] if cached and cached[0]>time.monotonic() else None
+        if key is None:
+            key = await request.app.state.db.fetchval(
+                "SELECT jwt_key FROM cab_watch_accounts.users WHERE id=$1", subject)
+            if key and pipeline:
+                pipeline.key_cache[subject] = (time.monotonic()+300,key)
+                pipeline.key_cache.move_to_end(subject)
+                while len(pipeline.key_cache)>10000:
+                    pipeline.key_cache.popitem(last=False)
         if not key:
             raise denied
         claims = jwt.decode(

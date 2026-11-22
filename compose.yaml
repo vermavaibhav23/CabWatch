@@ -14,15 +14,61 @@ services:
       retries: 30
   dashboard:
     build: .
-    ports: ["127.0.0.1:18080:8080"]
+    ports: ["127.0.0.1:${CABWATCH_PORT:-18080}:8080"]
     environment:
       DATABASE_URL: postgresql://cabwatch:cabwatch@db/cabwatch
+      TELEMETRY_MODE: ${TELEMETRY_MODE:-kafka}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REDIS_URL: redis://redis:6379/0
+      METRICS_TOKEN: ${METRICS_TOKEN:-local-development-only}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       TRIP_RETENTION_DAYS: ${TRIP_RETENTION_DAYS:-90}
       RETENTION_INTERVAL_HOURS: ${RETENTION_INTERVAL_HOURS:-6}
     depends_on:
       db: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+      redis: {condition: service_healthy}
+  kafka-storage:
+    image: redis:7.4-alpine
+    user: "0:0"
+    entrypoint: ["chown", "1000:1000", "/kafka-data"]
+    volumes: [cabwatch-kafka:/kafka-data]
+  kafka:
+    depends_on:
+      kafka-storage: {condition: service_completed_successfully}
+    image: apache/kafka:3.9.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    volumes: [cabwatch-kafka:/tmp/kraft-combined-logs]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction"]
+    volumes: [cabwatch-redis:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
 volumes:
   cabwatch-db: {}
 
 
+  cabwatch-kafka: {}
+  cabwatch-redis: {}

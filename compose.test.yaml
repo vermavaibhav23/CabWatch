@@ -1,0 +1,6 @@
+# Use only with the isolated cabwatch-fastapi-test compose project.
+services:
+  db:
+    ports: ["127.0.0.1:15433:5432"]
+  dashboard:
+    ports: !override ["127.0.0.1:18082:8080"]

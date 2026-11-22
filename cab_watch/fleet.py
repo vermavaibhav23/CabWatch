@@ -42,8 +42,25 @@ async def fleet_alerts(conn, user):
 async def list_trips(request: Request, user: UUID = Depends(owner)):
     async with request.app.state.db.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
         alerts = [dict(a) for a in await fleet_alerts(conn, user)]
+        for alert in alerts:
+            if alert.get("event_key"):
+                alert["id"]=str(alert["event_key"])
         rows = await conn.fetch(TRIP_SELECT + " WHERE t.user_id=$1 ORDER BY t.created_at", user)
-        return dict(trips=[trip_payload(row) for row in rows], alerts=alerts, limit=city.LIMIT)
+        result = dict(trips=[trip_payload(row) for row in rows], alerts=alerts, limit=city.LIMIT, telemetry_mode="direct")
+    pipeline = getattr(request.app.state,"pipeline",None)
+    if pipeline:
+        await pipeline.seed(rows,user)
+        result["telemetry_mode"] = "kafka"
+        # Accepted checkpoints restore the producer without presenting them as live detection.
+        ids=[str(row["id"]) for row in rows]
+        values=await pipeline.redis.mget([pipeline.prefix+"accepted:"+i for i in ids]) if ids else []
+        for trip,value in zip(result["trips"],values):
+            if value:
+                checkpoint=json.loads(value)
+                if checkpoint["sequence"]>trip["last_sequence"]:
+                    trip.update(last_sequence=checkpoint["sequence"],lat=checkpoint["lat"],lon=checkpoint["lon"],
+                        captured_at=checkpoint["captured_at"],motion=checkpoint.get("motion"))
+    return result
 
 
 @router.post("/trips", status_code=201)

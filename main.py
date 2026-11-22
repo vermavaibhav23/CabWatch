@@ -19,7 +19,14 @@ async def lifespan(app):
         db = await asyncpg.create_pool(os.environ["DATABASE_URL"], min_size=1, max_size=4, **pg_options)
         stack.push_async_callback(db.close)
         app.state.db = db
+        app.state.pipeline = None
         await stack.enter_async_context(cab_runtime(db))
+        mode = os.getenv("TELEMETRY_MODE", "direct")
+        if mode == "kafka":
+            from cab_watch.stream import runtime
+            await stack.enter_async_context(runtime(app))
+        elif mode != "direct":
+            raise ValueError("TELEMETRY_MODE must be direct or kafka")
         yield
 
 
@@ -32,4 +39,10 @@ app.mount("/cab-watch/assets", StaticFiles(directory=assets), name="assets")
 @app.get("/", include_in_schema=False)
 async def home():
     return RedirectResponse("/cab-watch/")
+
+
+@app.get("/healthz")
+async def health():
+    stream = app.state.pipeline
+    return {"status": "ok", "telemetry_mode": "kafka" if stream else "direct", "version": "kafka-recovery-v1"}
 
