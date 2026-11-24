@@ -70,3 +70,14 @@ class OffsetRecovery(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):await stream.consume(consumer)
         self.assertEqual(calls,['save','save','commit'])
         self.assertEqual(consumer.offsets,{'partition':8})
+
+class KafkaAuthentication(unittest.IsolatedAsyncioTestCase):
+    async def test_owner_does_not_depend_on_old_stream_key_cache(self):
+        from cab_watch.auth import owner,issue
+        from fastapi.security import HTTPAuthorizationCredentials
+        account=dict(id=uuid4(),name='Test',jwt_key=b'x'*32)
+        token=issue(account)['access_token']
+        db=SimpleNamespace(fetchval=AsyncMock(return_value=account['jwt_key']))
+        request=SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db=db,pipeline=object())))
+        credentials=HTTPAuthorizationCredentials(scheme='Bearer',credentials=token)
+        self.assertEqual(await owner(request,credentials),account['id'])
