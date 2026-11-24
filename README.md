@@ -36,6 +36,15 @@ Exactly four application tables exist in `cab_watch_accounts`:
 
 The consumer locks each trip, inserts previously unseen readings, rebuilds analysis in sequence order, and commits readings, derived alerts and trip checkpoints together. Only then does it commit Kafka offsets. A crash between SQL commit and offset commit safely replays. The first stored reading for a trip/sequence wins; conflicting duplicate content does not replace it. Historical alert IDs are deterministic, while internal numeric row IDs may change during recomputation. Use `event_key` as the durable incident identifier.
 
+Kafka records use a flat envelope: `trip_id`, `user_id`, `vehicle_id`, `route`,
+`sequence`, `captured_at`, `lat`, `lon`, and `motion`. There is no nested `point`
+or duplicated trip ID. The Kafka key remains the vehicle ID. Consumers also read
+older nested `point` records so retained messages can replay on the same topic.
+Accepted checkpoints and stored readings retain their existing reading-only
+shape; routing/ownership metadata is not copied into every stored GPS point.
+Pause uploads and replace all older app replicas before resuming: older consumers
+cannot read the new flat records. See the deployment checklist for rollout and rollback.
+
 ## Historical detection
 
 Every reading includes its measured distance and whether it is at least 200 metres off route. An incident requires three consecutive off-route samples, increasing capture timestamps, and no more than ten seconds between capture times. This is an evidence rule, not a processing-time freshness requirement. A week-old backlog still produces events dated at capture time. Missing sequences, reversed timestamps and capture gaps break confirmation; missing data is not proof a vehicle returned to its route. A later missing sample triggers deterministic recomputation. Completed journeys remain terminal for incident analysis; subsequent samples remain in recorded history.
@@ -64,7 +73,7 @@ JSONB keeps the requested four-table model but has an important cost: each chang
 
 ```sh
 python -m pip install -r requirements.txt
-python -m unittest -v test_cab_watch test_retention test_telemetry test_live test_journey
+python -m unittest -v test_cab_watch test_retention test_telemetry test_live test_journey test_stream
 node --test test_motion.mjs test_telemetry.mjs
 docker compose -p cabwatch-fastapi-test -f compose.yaml -f compose.test.yaml up -d --build
 ```

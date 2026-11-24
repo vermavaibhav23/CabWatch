@@ -15,7 +15,7 @@ jobs:
         with:
           node-version: '22'
       - run: pip install -r requirements.txt
-      - run: python -m unittest -v test_cab_watch test_retention test_telemetry test_live test_journey
+      - run: python -m unittest -v test_cab_watch test_retention test_telemetry test_live test_journey test_stream
       - run: node --test test_motion.mjs test_telemetry.mjs
       - run: docker compose -p cabwatch-fastapi-test -f compose.yaml -f compose.test.yaml up -d --build
       - run: python -m unittest -v test_schema test_kafka_flow

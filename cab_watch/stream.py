@@ -20,6 +20,17 @@ log = logging.getLogger(__name__)
 RETRIES = Counter('cabwatch_worker_retries', 'Journey worker retry attempts', ('worker',))
 LAG = Gauge('cabwatch_consumer_lag', 'Offset lag after committed journey transaction', ('worker','partition'))
 
+
+def reading_from_event(event):
+    """Keep stored readings stable while accepting old and flat Kafka records."""
+    point = event['point'] if 'point' in event else event
+    if point.get('trip_id', event['trip_id']) != event['trip_id']:
+        raise ValueError('Telemetry reading trip differs from envelope')
+    return dict(trip_id=event['trip_id'], sequence=point['sequence'],
+                captured_at=point['captured_at'], lat=point['lat'], lon=point['lon'],
+                motion=point.get('motion'))
+
+
 class Stream:
     def __init__(self, db):
         self.db = db
@@ -44,8 +55,8 @@ class Stream:
             if milliseconds(p['captured_at']) > int(now.timestamp()*1000)+2000:
                 raise HTTPException(422, 'Capture time is too far in the future')
             row = trips[point.trip_id]
-            events.append(dict(trip_id=str(point.trip_id),user_id=str(user),vehicle_id=row['vehicle_id'],
-                               route=json.loads(row['planned_route']),point=p))
+            events.append(dict(p, user_id=str(user), vehicle_id=row['vehicle_id'],
+                               route=json.loads(row['planned_route'])))
         await asyncio.gather(*(self.producer.send_and_wait(self.topic,json.dumps(e).encode(),key=e['vehicle_id'].encode()) for e in events))
         # Accepted checkpoint survives reloads even while the consumer is behind.
         # Failure after Kafka ACK returns 503; retry the identical trip/sequence.
@@ -53,8 +64,8 @@ class Stream:
             for e in sorted(events,key=lambda e:e['trip_id']):
                 await conn.execute("""UPDATE cab_watch_accounts.trips SET accepted_point=$2::jsonb
                     WHERE id=$1 AND coalesce((accepted_point->>'sequence')::integer,0)<$3""",
-                    UUID(e['trip_id']),json.dumps(e['point']),e['point']['sequence'])
-        return dict(mode='kafka',queued=True,results=[dict(trip_id=e['trip_id'],sequence=e['point']['sequence'],
+                    UUID(e['trip_id']),json.dumps(reading_from_event(e)),e['sequence'])
+        return dict(mode='kafka',queued=True,results=[dict(trip_id=e['trip_id'],sequence=e['sequence'],
                     queued=True,applied=False) for e in events])
 
     async def history(self, records):
@@ -72,7 +83,7 @@ class Stream:
                     continue
                 if any(e['vehicle_id']!=row['vehicle_id'] or e['user_id']!=str(row['user_id']) for e in events):
                     raise ValueError('Telemetry ownership differs from stored trip')
-                await persist_readings(conn,tid,[e['point'] for e in events])
+                await persist_readings(conn,tid,[reading_from_event(e) for e in events])
 
     async def consume(self, consumer):
         while True:
