@@ -11,105 +11,31 @@ from cab_watch import city
 
 @unittest.skipUnless(os.getenv("CABWATCH_TEST_URL"), "Requires running test instance")
 class AccountFlow(unittest.TestCase):
-    def test_missing_and_late_gps_in_a_multi_trip_batch(self):
-        with httpx.Client(base_url=os.environ["CABWATCH_TEST_URL"].rstrip("/") + "/", timeout=60) as client:
-            account = client.post("auth/register", json={
-                "name": "GPS check", "email": f"gps-{uuid4().hex}@example.invalid",
-                "password": secrets.token_urlsafe(20)})
-            account.raise_for_status()
-            client.headers["Authorization"] = "Bearer " + account.json()["access_token"]
-
-            def trip():
-                response = client.post("me/trips", headers={"Idempotency-Key": str(uuid4())},
-                                       json={"pickup": "G", "dropoff": "K"})
-                response.raise_for_status()
-                return response.json()["id"]
-
-            def point(trip_id, sequence, node):
-                lat, lon = city.gps(city.NODES[node])
-                return {"trip_id": trip_id, "sequence": sequence, "lat": lat, "lon": lon}
-
-            def send(*readings):
-                response = client.post("me/gps", json={"readings": readings})
-                response.raise_for_status()
-                return {row["trip_id"]: row for row in response.json()["results"]}
-
-            a, b = trip(), trip()
-            send(point(a, 13, "G"), point(b, 1, "G"))
-            opened = send(point(a, 15, "D"), point(b, 2, "H"))
-            self.assertEqual(opened[a]["alert"]["opened_sequence"], 15)
-            self.assertTrue(opened[b]["applied"])
-            late = send(point(a, 14, "I"), point(b, 3, "I"))
-            self.assertFalse(late[a]["applied"])
-            self.assertEqual(late[a]["sequence"], 15)
-            self.assertIsNone(late[a]["alert"]["closed_sequence"])
-            self.assertTrue(late[b]["applied"])
-            closed = send(point(a, 16, "J"))
-            self.assertEqual(closed[a]["alert"]["closed_sequence"], 16)
-            replay = send(point(a, 15, "D"))
-            self.assertFalse(replay[a]["applied"])
-            self.assertEqual(replay[a]["alert"]["closed_sequence"], 16)
-            finished = send(point(a, 17, "K"), point(b, 4, "K"))
-            self.assertTrue(all(row["completed"] for row in finished.values()))
-
-    def test_direct_trip_retry_alert_recovery_and_dropoff(self):
-        with httpx.Client(base_url=os.environ["CABWATCH_TEST_URL"].rstrip("/") + "/", timeout=60) as client:
-            def account():
-                reply = client.post("auth/register", json={
-                    "name": "Trip check", "email": f"ride-{uuid4().hex}@example.invalid",
-                    "password": secrets.token_urlsafe(20)})
-                reply.raise_for_status()
-                return {"Authorization": "Bearer " + reply.json()["access_token"]}
-
-            a, b = account(), account()
-            self.assertEqual(client.get("me/trips", headers=a).json()["trips"], [])
-            self.assertEqual(client.get("me/trips").status_code, 401)
-            request = {"pickup": "G", "dropoff": "K"}
-            headers = {**a, "Idempotency-Key": str(uuid4())}
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                replies = list(pool.map(lambda _: client.post("me/trips", headers=headers, json=request), range(2)))
-            self.assertEqual(sorted(r.status_code for r in replies), [200, 201])
-            trip = replies[0].json()
-            self.assertEqual(trip["id"], replies[1].json()["id"])
-            self.assertTrue({"planned_legs","phase","cab","color"}.isdisjoint(trip))
-            self.assertEqual(trip["route"], ["G","H","I","J","K"])
-            self.assertEqual(trip["metres"], 4143)
-            self.assertRegex(trip["vehicle_id"], r"^CB#[0-9]{3,}$")
-            self.assertEqual(client.post("me/trips", headers=headers, json={"pickup":"A","dropoff":"K"}).status_code, 409)
-            self.assertEqual(client.get("me/trips", headers=b).json()["trips"], [])
-            other = client.post("me/trips", headers={**b, "Idempotency-Key": str(uuid4())}, json=request)
-            self.assertEqual(other.status_code, 201)
-            self.assertNotEqual(other.json()["vehicle_id"], trip["vehicle_id"])
-
-            def sample(seq, node, mode, owner=a):
-                lat, lon = city.gps(city.NODES[node])
-                motion = {"mode": mode}
-                if mode == "detour":
-                    motion.update(trail=["I", "D", "I"] if seq >= 4 else ["I"], target=node)
-                elif mode == "route":
-                    motion["index"] = trip["route"].index(node)
-                return client.post("me/gps", headers=owner, json={"readings": [{
-                    "trip_id":trip["id"], "sequence":seq, "lat":lat, "lon":lon,
-                    "motion":motion}]})
-
-            self.assertEqual(sample(1,"G","route",b).status_code,422)
-            self.assertIsNone(sample(1,"G","route").json()["results"][0]["alert"])
-            self.assertEqual(sample(2,"D","detour").json()["results"][0]["alert"]["opened_sequence"],2)
-            checkpoint = client.get("me/trips", headers=a).json()["trips"][0]["motion"]
-            self.assertEqual(checkpoint, {"mode":"detour", "trail":["I"], "target":"D"})
-            self.assertEqual(sample(3,"I","detour").json()["results"][0]["alert"]["closed_sequence"],3)
-            self.assertEqual(sample(4,"D","detour").json()["results"][0]["alert"]["opened_sequence"],4)
-            self.assertFalse(sample(5,"K","detour").json()["results"][0]["completed"])
-            receipt = sample(6,"K","arrived").json()["results"][0]
-            self.assertTrue(receipt["completed"])
-            self.assertNotIn("parked",receipt)
-            self.assertFalse(sample(6,"K","arrived").json()["results"][0]["applied"])
-            restored = client.get("me/trips",headers=a).json()
-            self.assertTrue(restored["trips"][0]["completed"])
-            self.assertEqual(restored["trips"][0]["last_sequence"],6)
-            self.assertEqual(len(restored["alerts"]),2)
-            self.assertEqual(client.get("me/trips",headers=b).json()["alerts"],[])
-            another = client.post("me/trips",headers={**a,"Idempotency-Key":str(uuid4())},json=request)
-            self.assertEqual(another.status_code,201)
-            self.assertEqual(another.json()["vehicle_id"],trip["vehicle_id"])
-            self.assertEqual(len(client.get("me/trips",headers=a).json()["trips"]),2)
+    def test_historical_late_readings_ownership_and_trip_idempotency(self):
+        with httpx.Client(base_url=os.environ['CABWATCH_TEST_URL'].rstrip('/')+'/',timeout=60) as c:
+            r=c.post('auth/register',json=dict(name='History',email=f'{uuid4()}@example.invalid',password=secrets.token_urlsafe(20)))
+            r.raise_for_status();c.headers['Authorization']='Bearer '+r.json()['access_token']
+            headers={'Idempotency-Key':str(uuid4())}
+            r=c.post('me/trips',headers=headers,json=dict(pickup='G',dropoff='K'))
+            r.raise_for_status();trip=r.json()['id']
+            self.assertEqual(c.post('me/trips',headers=headers,json=dict(pickup='G',dropoff='K')).json()['id'],trip)
+            self.assertEqual(c.post('me/trips',headers=headers,json=dict(pickup='A',dropoff='K')).status_code,409)
+            def send(seq,node='D'):
+                lat,lon=city.gps(city.NODES[node])
+                r=c.post('me/gps',json={'readings':[dict(trip_id=trip,sequence=seq,lat=lat,lon=lon,captured_at=f'2020-01-01T00:00:0{seq}Z')]})
+                r.raise_for_status();return r.json()
+            send(1);send(3)
+            self.assertEqual(c.get(f'me/trips/{trip}/history').json()['alerts'],[])
+            send(2);send(2);send(4,'H');send(5,'K')
+            h=c.get(f'me/trips/{trip}/history').json()
+            self.assertEqual([p['sequence'] for p in h['readings']],[1,2,3,4,5])
+            self.assertEqual(len(h['alerts']),1)
+            self.assertEqual((h['alerts'][0]['opened_sequence'],h['alerts'][0]['closed_sequence']),(3,4))
+            self.assertTrue(h['alerts'][0]['opened_at'].startswith('2020-01-01'))
+            self.assertTrue(c.get('me/trips').json()['trips'][0]['completed'])
+            c.headers.pop('Authorization')
+            self.assertEqual(c.get(f'me/trips/{trip}/history').status_code,401)
+            r=c.post('auth/register',json=dict(name='Other',email=f'{uuid4()}@example.invalid',password=secrets.token_urlsafe(20)))
+            c.headers['Authorization']='Bearer '+r.json()['access_token']
+            self.assertEqual(c.get(f'me/trips/{trip}/history').status_code,404)
+            self.assertEqual(c.get('me/trips').json()['trips'],[])

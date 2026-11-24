@@ -1,33 +1,13 @@
-# Kafka cutover for the existing FastAPI Render service
+# Journey-history cutover
 
-Existing URL: https://ev-charger-guide.onrender.com/cab-watch/
-Repository: https://github.com/vermavaibhav23/CabWatch (main)
+This changes the application to one historical Kafka consumer group and four PostgreSQL tables. It does not provision hosting or automatically switch a running service. Existing Render auto-deploy settings may deploy a push to main; coordinate the following before enabling the new code against production.
 
-This is the original Python service, not CabWatch-Java. No new paid resources are created by this repository.
+1. Back up PostgreSQL, Redis and Kafka configuration. Pause GPS senders. On the OLD release, drain both Kafka groups and the Redis `cabwatch:events` SQL outbox. Verify history and pending alert/completion events have reached PostgreSQL. The new release does not read Redis, so deleting Redis first can lose unpersisted events.
+2. Stop every old application replica. Never run old and new schema writers together. Keep old Redis data until the cutover has been verified; the new Compose file leaves its named volume untouched.
+3. Deploy the new code. Startup transactionally copies the fifth table's GPS history into `trips.readings`, rebuilds history state, then drops `telemetry_history`. No `CASCADE` is used. A failed migration rolls back. Existing users, vehicles, trips and legacy alerts remain. On large databases, schedule enough migration time and disk headroom.
+4. Supply `DATABASE_URL`, `TELEMETRY_MODE=kafka`, `KAFKA_BOOTSTRAP_SERVERS`, and `METRICS_TOKEN`. Keep existing SSL/SASL variables (`KAFKA_SECURITY_PROTOCOL`, `KAFKA_SSL_CA_PEM`, `KAFKA_SASL_MECHANISM`, `KAFKA_USERNAME`, `KAFKA_PASSWORD`). Redis settings are no longer used.
+5. Keep `KAFKA_TOPIC=cabwatch.gps.recovery.v1` if continuing the current record schema. The NEW group defaults to `<topic>.journey-history-v1`; do not reuse old group IDs. It reads retained data from earliest and deduplicates against stored trip readings. Existing SQL history older than Kafka retention is preserved by migration. Kafka records whose trips were already deleted by retention are skipped.
+6. Defaults: `KAFKA_PARTITIONS=12`, `KAFKA_REPLICATION_FACTOR=1`, `HISTORY_CONSUMERS=1` per process. Existing topics are not resized. For a suitable production cluster use replicated brokers and configure minimum in-sync replicas appropriately. `KAFKA_CREATE_TOPIC=false` permits administrator-managed topics. Retention must cover maximum outage and catch-up time.
+7. Verify `/healthz` reports `journey-history-v1`. Verify exactly users, vehicles, trips and alerts in `cab_watch_accounts`. Upload historical samples including a duplicate and a missing sample arriving late; check capture-time incidents and unique history. Restart a worker and verify unchanged results. Resume senders and reload dashboards.
 
-1. Keep the current DATABASE_URL, database CA and optional Gemini settings. Back up the database. Deploy main with TELEMETRY_MODE=direct first; migrations are additive.
-2. Provision or reuse a reachable Kafka broker and persistent standalone Redis. Supply the following environment values in the existing Render service (never commit secrets):
-
-| Variable | Value / purpose |
-| --- | --- |
-| TELEMETRY_MODE | kafka, only after all dependencies are ready |
-| KAFKA_BOOTSTRAP_SERVERS | Existing broker host:port list |
-| KAFKA_SECURITY_PROTOCOL | SASL_SSL or SSL for a hosted broker |
-| KAFKA_SSL_CA_PEM | Broker CA if not publicly trusted |
-| KAFKA_SASL_MECHANISM | Provider mechanism, normally PLAIN or SCRAM-SHA-256/512 |
-| KAFKA_USERNAME / KAFKA_PASSWORD | Existing broker credentials for SASL |
-| REDIS_URL | Authenticated redis:// or rediss:// endpoint |
-| METRICS_TOKEN | Random monitoring token |
-| KAFKA_TOPIC | cabwatch.gps.recovery.v1; use a fresh topic for this schema |
-| KAFKA_CREATE_TOPIC | false if an administrator created the topic |
-| KAFKA_PARTITIONS | 12 for auto-creation; existing topic is not changed |
-| KAFKA_REPLICATION_FACTOR | Match broker capacity; use 3 on a suitable production cluster |
-| LIVE_CONSUMERS / HISTORY_CONSUMERS | 2 each initially; total across replicas <= partitions |
-| LIVE_STALE_MS | 10000 initially |
-
-3. Configure Kafka retention/storage for outages. Use replication and min.insync.replicas appropriate to the hosted cluster. The local single-broker configuration is not a production HA prescription. Configure Redis persistence/noeviction as described in README. Do not use a cache tier that can silently evict state or lose pending SQL events.
-4. Pause GPS senders. Drain any existing direct requests, then restart all replicas in Kafka mode. Avoid mixed direct/Kafka processes during rollout. Reload existing dashboards so they use the asynchronous response format. Existing open legacy incidents are historical until fresh Kafka confirmation establishes the current state.
-5. Check /healthz: version kafka-recovery-v1 and telemetry_mode kafka. Test one trip: 202 queued, live sequence advances, three fresh deviations open an incident, stale readings show delayed, and history includes them. Confirm metrics and SQL outbox catch-up. Verify across a restart before relying on it.
-6. For rollback, pause GPS; drain BOTH consumer groups and the Redis SQL outbox before switching all replicas to direct. Restart dashboards. Do not revert the database migration or delete broker/Redis data. A rollback while work is queued can leave history or incidents unapplied.
-
-A GitHub push alone only changes the live service if its Render auto-deploy is enabled. Verify the deployed mode; a successful direct-mode deployment does not mean Kafka is active. New infrastructure can incur charges and requires an explicit hosting decision.
+The new UI exposes historical processing progress, not a real-time alert guarantee. Legacy alerts remain alongside derived historical incidents. Preserve backups until verified. Rollback to old code requires a coordinated database restore/migration plan: the old code expects a fifth table and Redis state, so do not simply restart it against this schema.

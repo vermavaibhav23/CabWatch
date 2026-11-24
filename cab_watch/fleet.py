@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from . import city
 from .auth import owner
+from .journey import decode
 
 router = APIRouter(prefix="/me")
 
@@ -26,10 +27,16 @@ def trip_payload(row):
                   completed=row["completed_at"] is not None,
                   last_sequence=row["last_sequence"], distance_m=distance,
                   lat=row["last_lat"], lon=row["last_lon"], captured_at=row["last_captured_at"],
-                  motion=json.loads(row["motion"]) if row["motion"] else None)
+                  motion=json.loads(row["motion"]) if row["motion"] else None,
+                  processed_at=row.get('processed_at'),
+                  accepted_point=decode(row.get('accepted_point'),None),
+                  processing_pending=(decode(row.get('accepted_point'),{}).get('sequence',0)>row['last_sequence']))
 
 
-TRIP_SELECT = "SELECT t.* FROM cab_watch_accounts.trips t"
+# Do not transfer potentially large journey JSON on every roster poll.
+TRIP_SELECT = """SELECT t.id,t.user_id,t.idempotency_key,t.vehicle_id,t.planned_route,
+    t.last_sequence,t.last_lat,t.last_lon,t.last_captured_at,t.motion,t.created_at,t.completed_at,
+    t.processed_at,t.accepted_point FROM cab_watch_accounts.trips t"""
 
 
 async def fleet_alerts(conn, user):
@@ -47,19 +54,9 @@ async def list_trips(request: Request, user: UUID = Depends(owner)):
                 alert["id"]=str(alert["event_key"])
         rows = await conn.fetch(TRIP_SELECT + " WHERE t.user_id=$1 ORDER BY t.created_at", user)
         result = dict(trips=[trip_payload(row) for row in rows], alerts=alerts, limit=city.LIMIT, telemetry_mode="direct")
-    pipeline = getattr(request.app.state,"pipeline",None)
-    if pipeline:
-        await pipeline.seed(rows,user)
+    if getattr(request.app.state,"pipeline",None):
         result["telemetry_mode"] = "kafka"
-        # Accepted checkpoints restore the producer without presenting them as live detection.
-        ids=[str(row["id"]) for row in rows]
-        values=await pipeline.redis.mget([pipeline.prefix+"accepted:"+i for i in ids]) if ids else []
-        for trip,value in zip(result["trips"],values):
-            if value:
-                checkpoint=json.loads(value)
-                if checkpoint["sequence"]>trip["last_sequence"]:
-                    trip.update(last_sequence=checkpoint["sequence"],lat=checkpoint["lat"],lon=checkpoint["lon"],
-                        captured_at=checkpoint["captured_at"],motion=checkpoint.get("motion"))
+    result['view_mode'] = 'history'
     return result
 
 

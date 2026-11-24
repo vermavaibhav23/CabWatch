@@ -61,19 +61,15 @@ def run_immediate(coroutine):
 
 
 class RetentionEvidenceTests(unittest.TestCase):
-    def test_alert_records_opening_sequence_and_peak(self):
-        trip_id = uuid4()
-        trip = {
-            "last_sequence": 2, "motion": None, "completed_at": None,
-            "planned_route": json.dumps(["A","B"]),
-            "vehicle_id": None,
-        }
-        conn = RecordingConnection(trip)
-        lat, lon = city.gps(city.NODES["Z"])
-        run_immediate(record(conn, trip, Point(trip_id=trip_id, sequence=3, lat=lat, lon=lon)))
-        alert_write = next(args for sql, args in conn.writes if "INSERT INTO cab_watch_accounts.alerts" in sql)
-        self.assertEqual(alert_write[:2], (trip_id, 3))
-        self.assertGreater(alert_write[2], 200)
+    def test_alert_records_capture_time_and_peak(self):
+        from cab_watch.journey import analyse
+        trip=dict(id=uuid4(),user_id=uuid4(),vehicle_id='CB#001',planned_route=['G','H','I','J','K'])
+        lat,lon=city.gps(city.NODES['D'])
+        points={str(i):dict(sequence=i,lat=lat,lon=lon,captured_at=f'2020-01-01T00:00:0{i}+00:00') for i in range(1,4)}
+        _,_,alerts,_=analyse(trip,points)
+        self.assertEqual(alerts[0]['opened_sequence'],3)
+        self.assertEqual(alerts[0]['opened_at'],'2020-01-01T00:00:03+00:00')
+        self.assertGreater(alerts[0]['peak_metres'],200)
 
     def test_explanation_uses_alert_fields_without_gps_rows(self):
         trip_id = uuid4()

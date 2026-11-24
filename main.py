@@ -21,7 +21,7 @@ async def lifespan(app):
         app.state.db = db
         app.state.pipeline = None
         await stack.enter_async_context(cab_runtime(db))
-        mode = os.getenv("TELEMETRY_MODE", "direct")
+        mode = os.getenv("TELEMETRY_MODE", "kafka")
         if mode == "kafka":
             from cab_watch.stream import runtime
             await stack.enter_async_context(runtime(app))
@@ -44,5 +44,5 @@ async def home():
 @app.get("/healthz")
 async def health():
     stream = app.state.pipeline
-    return {"status": "ok", "telemetry_mode": "kafka" if stream else "direct", "version": "kafka-recovery-v1"}
+    return {"status": "ok", "telemetry_mode": "kafka" if stream else "direct", "version": "journey-history-v1"}
 

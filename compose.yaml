@@ -19,7 +19,6 @@ services:
       DATABASE_URL: postgresql://cabwatch:cabwatch@db/cabwatch
       TELEMETRY_MODE: ${TELEMETRY_MODE:-kafka}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      REDIS_URL: redis://redis:6379/0
       METRICS_TOKEN: ${METRICS_TOKEN:-local-development-only}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       TRIP_RETENTION_DAYS: ${TRIP_RETENTION_DAYS:-90}
@@ -27,9 +26,8 @@ services:
     depends_on:
       db: {condition: service_healthy}
       kafka: {condition: service_healthy}
-      redis: {condition: service_healthy}
   kafka-storage:
-    image: redis:7.4-alpine
+    image: alpine:3.21
     user: "0:0"
     entrypoint: ["chown", "1000:1000", "/kafka-data"]
     volumes: [cabwatch-kafka:/kafka-data]
@@ -57,18 +55,9 @@ services:
       interval: 10s
       timeout: 10s
       retries: 30
-  redis:
-    image: redis:7.4-alpine
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction"]
-    volumes: [cabwatch-redis:/data]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 3s
-      timeout: 3s
-      retries: 30
+
 volumes:
   cabwatch-db: {}
 
 
   cabwatch-kafka: {}
-  cabwatch-redis: {}

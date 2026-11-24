@@ -94,7 +94,7 @@ class TripSchema(unittest.IsolatedAsyncioTestCase):
         after = await self.sql('SELECT * FROM cab_watch_accounts.trips ORDER BY id')
         tables = await self.sql("""SELECT table_name FROM information_schema.tables
             WHERE table_schema='cab_watch_accounts' AND table_type='BASE TABLE'""")
-        self.assertEqual({r['table_name'] for r in tables}, {'users','vehicles','trips','alerts','telemetry_history'})
+        self.assertEqual({r['table_name'] for r in tables}, {'users','vehicles','trips','alerts'})
         for original, updated in zip(before, after):
             for column in set(original.keys()) - {'motion','planned_legs','distance_m','phase'}:
                 self.assertEqual(original[column], updated[column])
@@ -152,28 +152,49 @@ class TripSchema(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]['trip_id'], tid)
         self.assertNotIn('user_id', (await self.sql('SELECT * FROM cab_watch_accounts.trips'))[0].keys())
 
-    async def test_event_replay_does_not_close_a_newer_incident(self):
-        from datetime import datetime, timezone
-        from types import SimpleNamespace
-        from cab_watch.stream import Stream
+    async def test_five_table_migration_copies_all_readings_and_is_repeatable(self):
         await self.migrate()
         await self.seed()
         tid=(await self.insert_trip(self.a,uuid4(),self.cars[0]))[0]['id']
-        await self.sql("INSERT INTO cab_watch_accounts.alerts(trip_id,opened_sequence,peak_metres) VALUES($1,15,250)",tid)
-        writer=object.__new__(Stream)
-        conn=SimpleNamespace(execute=self.sql)
-        reset=dict(kind='reset',trip_id=str(tid),sequence=17)
-        await writer.persist_event(conn,reset)
-        now=datetime.now(timezone.utc).isoformat()
-        alert=dict(id=str(uuid4()),trip_id=str(tid),opened_sequence=20,closed_sequence=None,peak_metres=300,opened_at=now,resolved_at=None)
-        await writer.persist_event(conn,dict(kind='alert',alert=alert))
-        # Crash after SQL commit but before Redis ACK can replay earlier events.
-        await writer.persist_event(conn,reset)
-        await writer.persist_event(conn,dict(kind='alert',alert=alert))
-        rows=await self.sql('SELECT * FROM cab_watch_accounts.alerts WHERE event_key=$1',UUID(alert['id']))
-        self.assertIsNone(rows[0]['closed_sequence'])
-        closed={**alert,'closed_sequence':21,'resolved_at':now,'close_reason':'returned to route'}
-        await writer.persist_event(conn,dict(kind='alert',alert=closed))
-        await writer.persist_event(conn,dict(kind='alert',alert=alert))
-        rows=await self.sql('SELECT * FROM cab_watch_accounts.alerts WHERE event_key=$1',UUID(alert['id']))
-        self.assertEqual(rows[0]['closed_sequence'],21)
+        await self.sql("""CREATE TABLE cab_watch_accounts.telemetry_history (
+            trip_id uuid,sequence integer,captured_at timestamptz,lat float8,lon float8,motion jsonb,
+            PRIMARY KEY(trip_id,sequence))""")
+        await self.sql("""INSERT INTO cab_watch_accounts.telemetry_history VALUES
+            ($1,1,'2020-01-01T00:00:01Z',13.0,80.0,null),
+            ($1,2,'2020-01-01T00:00:02Z',13.0,80.0,null),
+            ($1,3,'2020-01-01T00:00:03Z',13.0,80.0,null)""",tid)
+        await self.migrate()
+        before=await self.sql('SELECT * FROM cab_watch_accounts.trips WHERE id=$1',tid)
+        self.assertEqual(len(json.loads(before[0]['readings'])),3)
+        self.assertEqual((await self.sql('SELECT opened_at FROM cab_watch_accounts.alerts WHERE historical'))[0]['opened_at'].year,2020)
+        await self.migrate()
+        self.assertEqual(before,await self.sql('SELECT * FROM cab_watch_accounts.trips WHERE id=$1',tid))
+        tables=await self.sql("SELECT table_name FROM information_schema.tables WHERE table_schema='cab_watch_accounts' AND table_type='BASE TABLE'")
+        self.assertEqual({r['table_name'] for r in tables},{'users','vehicles','trips','alerts'})
+
+    async def test_transaction_rollback_and_duplicate_conflicts(self):
+        from cab_watch.journey import persist_readings
+        from cab_watch import city
+        await self.migrate();await self.seed()
+        tid=(await self.insert_trip(self.a,uuid4(),self.cars[0]))[0]['id']
+        outer=self
+        class Conn:
+            async def fetchrow(self,q,*args):
+                return await outer.db.fetchrow(q.replace('cab_watch_accounts',outer.namespace),*args)
+            async def execute(self,q,*args):
+                return await outer.db.execute(q.replace('cab_watch_accounts',outer.namespace),*args)
+        conn=Conn()
+        lat,lon=city.gps(city.NODES['D'])
+        def point(i):return dict(sequence=i,lat=lat,lon=lon,captured_at=f'2020-01-01T00:00:0{i}Z')
+        async with self.db.transaction():await persist_readings(conn,tid,[point(1),point(3)])
+        self.assertEqual(await self.sql('SELECT * FROM cab_watch_accounts.alerts WHERE historical'),[])
+        with self.assertRaises(RuntimeError):
+            async with self.db.transaction():
+                await persist_readings(conn,tid,[point(2)])
+                raise RuntimeError('crash before transaction commit')
+        self.assertEqual(len(json.loads((await self.sql('SELECT readings FROM cab_watch_accounts.trips WHERE id=$1',tid))[0]['readings'])),2)
+        async with self.db.transaction():await persist_readings(conn,tid,[point(2)])
+        before=await self.sql('SELECT * FROM cab_watch_accounts.alerts WHERE historical')
+        async with self.db.transaction():await persist_readings(conn,tid,[dict(point(2),lat=0,lon=0)])
+        self.assertEqual(before,await self.sql('SELECT * FROM cab_watch_accounts.alerts WHERE historical'))
+        self.assertEqual(json.loads((await self.sql('SELECT readings FROM cab_watch_accounts.trips WHERE id=$1',tid))[0]['readings'])['2']['lat'],lat)

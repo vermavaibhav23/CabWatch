@@ -1,4 +1,7 @@
-"""Deterministic live detection. History never uses this policy to discard samples."""
+"""Pure route-confirmation state machine (no consumer or Redis).
+
+Journey analysis evaluates this at capture time, retaining all historical samples.
+"""
 from copy import deepcopy
 from datetime import datetime, timezone
 from uuid import UUID, uuid5

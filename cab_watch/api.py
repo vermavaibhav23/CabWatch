@@ -79,34 +79,20 @@ async def latest_alert(conn, trip_id):
 
 
 async def record(conn, trip, reading):
-    line = [city.NODES[node] for node in json.loads(trip["planned_route"])]
-    completed = trip["completed_at"] is not None
-    if reading.sequence <= trip["last_sequence"] or completed:
-        distance = city.distance_from_path(line, trip["last_lat"], trip["last_lon"]) if trip["last_lat"] is not None else 0
-        return dict(trip_id=reading.trip_id, sequence=trip["last_sequence"], applied=False,
-                    distance_m=distance, completed=completed, alert=await latest_alert(conn, reading.trip_id))
-    distance = city.distance_from_path(line, reading.lat, reading.lon)
-    motion = reading.motion.model_dump_json() if reading.motion else None
-    await conn.execute("""UPDATE cab_watch_accounts.trips SET last_sequence=$2,motion=$3::jsonb,
-        last_lat=$4,last_lon=$5,last_captured_at=$6
-        WHERE id=$1""", reading.trip_id, reading.sequence, motion,
-        reading.lat, reading.lon, reading.captured_at)
-    if distance >= city.LIMIT:
-        incident = await conn.fetchrow("""INSERT INTO cab_watch_accounts.alerts
-            (trip_id,opened_sequence,peak_metres)
-            VALUES($1,$2,$3) ON CONFLICT(trip_id) WHERE closed_sequence IS NULL
-            DO UPDATE SET peak_metres=greatest(cab_watch_accounts.alerts.peak_metres,excluded.peak_metres) RETURNING *""",
-            reading.trip_id, reading.sequence, distance)
-    else:
-        incident = await conn.fetchrow("""UPDATE cab_watch_accounts.alerts SET closed_sequence=$2,resolved_at=now()
-            WHERE trip_id=$1 AND closed_sequence IS NULL RETURNING *""", reading.trip_id, reading.sequence)
-    arrived = reading.motion is None or reading.motion.mode == "arrived"
-    completed = arrived and city.distance_from_path([line[-1]], reading.lat, reading.lon) < 1
-    if completed:
-        await conn.execute("UPDATE cab_watch_accounts.trips SET completed_at=now() WHERE id=$1", reading.trip_id)
-        await conn.execute("UPDATE cab_watch_accounts.vehicles SET status='available' WHERE id=$1", trip["vehicle_id"])
-    return dict(trip_id=reading.trip_id, sequence=reading.sequence, applied=True,
-                distance_m=distance, completed=completed, alert=dict(incident) if incident else None)
+    from datetime import datetime, timezone
+    from .journey import persist_readings, decode
+    point = reading.model_dump(mode="json")
+    point['captured_at'] = point['captured_at'] or datetime.now(timezone.utc).isoformat()
+    from .live import milliseconds
+    if milliseconds(point['captured_at']) > datetime.now(timezone.utc).timestamp()*1000+2000:
+        raise HTTPException(422, 'Capture time is too far in the future')
+    applied = str(reading.sequence) not in decode(trip['readings'], {})
+    await persist_readings(conn,reading.trip_id,[point])
+    updated = await conn.fetchrow('SELECT * FROM cab_watch_accounts.trips WHERE id=$1',reading.trip_id)
+    state = decode(updated['history_state'], {})
+    alert = await latest_alert(conn,reading.trip_id)
+    return dict(trip_id=reading.trip_id,sequence=updated['last_sequence'],applied=applied,
+                distance_m=state.get('distance_m',0),completed=updated['completed_at'] is not None,alert=alert)
 
 
 async def apply_schema(conn, namespace="cab_watch_accounts"):
@@ -120,6 +106,16 @@ async def apply_schema(conn, namespace="cab_watch_accounts"):
 
     await conn.execute((ROOT / "normalize_trips.sql").read_text(encoding="utf-8").replace("cab_watch_accounts", namespace))
     await conn.execute((ROOT / "kafka_schema.sql").read_text(encoding="utf-8").replace("cab_watch_accounts", namespace))
+    from .journey import persist_readings
+    # Namespace test schemas use the same migration; rewrite queries via a small adapter.
+    class Namespaced:
+        async def fetchrow(self, query, *args):
+            return await conn.fetchrow(query.replace('cab_watch_accounts',namespace),*args)
+        async def execute(self, query, *args):
+            return await conn.execute(query.replace('cab_watch_accounts',namespace),*args)
+    for row in await conn.fetch(f"SELECT id FROM {namespace}.trips WHERE readings <> '{{}}'::jsonb AND history_state IS NULL ORDER BY id"):
+        await persist_readings(Namespaced(),row['id'],[])
+
 
 
 @asynccontextmanager
@@ -173,25 +169,22 @@ async def ingest(batch: Batch, request: Request, user: UUID=Depends(owner)):
             raise
 
 
-@router.get("/me/live")
-async def live(request: Request, user: UUID=Depends(owner)):
-    pipeline = getattr(request.app.state, "pipeline", None)
-    if not pipeline:
-        return {"enabled": False, "states": [], "alerts": []}
-    try:
-        return await pipeline.snapshot(user)
-    except Exception:
-        raise HTTPException(503, "Live tracking is delayed; state store unavailable") from None
-
-
 @router.get("/me/trips/{trip_id}/history")
 async def history(trip_id: UUID, request: Request, after: int=0, user: UUID=Depends(owner)):
-    db = request.app.state.db
-    if not await db.fetchval("SELECT 1 FROM cab_watch_accounts.trips WHERE id=$1 AND user_id=$2",trip_id,user):
-        raise HTTPException(404,"Unknown trip")
-    rows = await db.fetch("""SELECT sequence,captured_at,lat,lon,motion FROM cab_watch_accounts.telemetry_history
-        WHERE trip_id=$1 AND sequence>$2 ORDER BY sequence LIMIT 1000""",trip_id,max(0,after))
-    return {"readings":[dict(r) for r in rows]}
+    from .journey import decode
+    async with request.app.state.db.acquire() as conn, conn.transaction(isolation='repeatable_read',readonly=True):
+        row=await conn.fetchrow("SELECT * FROM cab_watch_accounts.trips WHERE id=$1 AND user_id=$2",trip_id,user)
+        if row is None:
+            raise HTTPException(404,"Unknown trip")
+        points=sorted(decode(row['readings'],{}).values(),key=lambda p:p['sequence'])
+        page=[p for p in points if p['sequence']>max(0,after)][:1000]
+        alerts=await conn.fetch('SELECT * FROM cab_watch_accounts.alerts WHERE trip_id=$1 ORDER BY opened_sequence,id',trip_id)
+    accepted=decode(row['accepted_point'],{})
+    return dict(readings=page,alerts=[dict(a) for a in alerts],total=len(points),
+                next_after=page[-1]['sequence'] if page else after,
+                has_more=bool(page and page[-1]['sequence']<points[-1]['sequence']),
+                processed_sequence=row['last_sequence'],accepted_sequence=max(row['last_sequence'],accepted.get('sequence',0)),
+                processed_at=row['processed_at'])
 
 
 @router.get("/metrics", include_in_schema=False)
@@ -236,9 +229,6 @@ async def explain(alert_id: str, request: Request,user: UUID=Depends(owner)):
     alert = await db.fetchrow(f"""SELECT a.*,t.vehicle_id FROM cab_watch_accounts.alerts a
         JOIN cab_watch_accounts.trips t ON t.id=a.trip_id
         WHERE t.user_id=$1 AND {column}=$2""",user,value)
-    if not alert and getattr(request.app.state,"pipeline",None):
-        view = await request.app.state.pipeline.snapshot(user)
-        alert = next((a for a in view["alerts"] if str(a["id"])==alert_id),None)
     if not alert:
         raise HTTPException(404, "Unknown alert for this simulation")
     facts = dict(vehicle_id=alert["vehicle_id"], threshold_m=city.LIMIT,

@@ -9,7 +9,7 @@ const colors=[
     "#38578c", "#885a0b", "#426d57", "#804991", "#2d7782", "#8c5436",
     "#536aaf", "#923b32",
 ];
-const stage=c=>c.mode==='arrived'?(fleet?.telemetry_mode==='kafka'&&!c.liveCompleted?'Awaiting confirmation':'Completed'):'With customer';
+const stage=c=>c.mode==='arrived'?(fleet?.telemetry_mode==='kafka'&&!c.liveCompleted?'Awaiting history processing':'Completed'):'With customer';
 let fleet,selected,running=false,frame,timer,changing=false,reviewGeneration=0,network,dispatchKey;
 const msg=text=>{$('message').textContent=text;};
 const element=(tag,text,cls)=>{const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e;};
@@ -31,7 +31,7 @@ async function api(path,method='GET',body,extraHeaders={}){
   return response.json();
 }
 function chosen(){return fleet?.cabs.find(c=>c.id===selected);}
-function select(id){selected=id;selectMap(fleet.cabs,id);render();}
+function select(id){selected=id;selectMap(fleet.cabs,id);render();loadHistory(fleet,id);}
 function alertFor(c){return fleet.alerts.find(a=>a.trip_id===c.id&&a.closed_sequence===null&&!a.tracking_delayed&&!c.delayed);}
 
 
@@ -53,7 +53,7 @@ function render(){
     c.row.setAttribute('aria-pressed',String(c.id===selected));
     const alarm=alertFor(c);
     c.row.classList.toggle('alarm',Boolean(alarm));
-    c.badge.textContent=c.delayed?'Tracking delayed':c.tracking==='CONFIRMING'?'Confirming deviation':alarm?'Off-route alert':c.mode==='turn requested'?'Turn queued':
+    c.badge.textContent=c.confirmed<c.sequence?'History processing':alarm?'Deviation in last record':c.mode==='turn requested'?'Turn queued':
       c.mode==='detour'?'Route changed':stage(c);
     c.desc.textContent=c.origin+' → '+c.destination;
   }
@@ -65,18 +65,19 @@ function render(){
     $('selected').textContent=c.vehicle_id+' · '+c.origin+' → '+c.destination;
     $('tripline').textContent=c.origin+' → '+c.destination+' · '+(c.metres/1000).toFixed(2)+' km · '+stage(c);
     $('distance').textContent=Math.round(c.offset)+' m from planned route · GPS #'+c.confirmed+
-      ' · Alert at '+fleet.limit+' m'+(fleet.telemetry_mode==='kafka'?' after 3 fresh readings':'');
+      ' · Recorded '+(c.displayCapturedAt?new Date(c.displayCapturedAt).toLocaleString():'not yet')+' · Historical confirmation: 3 consecutive readings';
     $('wrong').disabled=changing||c.mode!=='route'||c.index+1>=c.route.length-1;
     $('return').disabled=changing||!['detour','turn requested'].includes(c.mode);
   }
-  const logKey=JSON.stringify(fleet.alerts.map(a=>[a.id,a.closed_sequence,a.tracking_delayed,Math.round(a.peak_metres)]));
+  const selectedAlerts=fleet.historyAlerts?.[selected]||fleet.alerts.filter(a=>a.trip_id===selected);
+  const logKey=JSON.stringify([selected,selectedAlerts.map(a=>[a.id,a.closed_sequence,a.tracking_delayed,Math.round(a.peak_metres)])]);
   if(logKey!==fleet.logKey){
     fleet.logKey=logKey;const log=$('alerts');log.replaceChildren();
-    if(!fleet.alerts.length)log.append(element('p','No route alerts in this simulation.','muted'));
-    for(const a of fleet.alerts){
+    if(!selectedAlerts.length)log.append(element('p','No recorded deviations for this trip.','muted'));
+    for(const a of selectedAlerts){
       const row=element('div',undefined,'logrow'),info=element('div');
-      info.append(element('strong',a.vehicle_id+' · '+(a.tracking_delayed?'Tracking delayed':a.closed_sequence?(a.close_reason||'Resolved'):'Check trip')),
-        element('small','Opened at GPS #'+a.opened_sequence+' · peak '+Math.round(a.peak_metres)+' m'));
+      info.append(element('strong',a.vehicle_id+(a.historical===false?' · Legacy record':'')+' · '+(a.tracking_delayed?'Tracking delayed':a.closed_sequence?(a.close_reason||'Resolved'):'Open at last recorded sample')),
+        element('small','Captured '+new Date(a.opened_at).toLocaleString()+' · GPS #'+a.opened_sequence+' · peak '+Math.round(a.peak_metres)+' m'));
       const b=element('button','Explain alert');b.onclick=()=>explain(a);row.append(info,b);log.append(row);
     }
   }
@@ -151,7 +152,7 @@ function tick(f){
         f.cabs.forEach((cab,index)=>Object.assign(cab,before[index]));
         running=false;f.failed=true;msg('Unable to save pending GPS locally. '+e.message);render();return;
       }
-      if(f.telemetry_mode!=='kafka')for(const cab of moving)showPoint(cab,cab.point);
+      // Map positions come from persisted journey history.
       cancelAnimationFrame(frame);draw(performance.now());
       f.seconds+=5;
     }else running=false;
@@ -221,51 +222,72 @@ function restoreTrip(trip){
   c.color=colors[(c.cab+colors.length-1)%colors.length];
   c.capturedAt=trip.captured_at;
   c.confirmed=c.sequence=trip.last_sequence;c.offset=trip.distance_m;
-  if(fleet.telemetry_mode==='kafka'){if(!trip.completed)c.confirmed=0;c.delayed=!trip.completed;c.liveCompleted=trip.completed;}
+  c.liveCompleted=trip.completed;c.displayCapturedAt=trip.captured_at;
   if(trip.lat!==null)c.point=[(trip.lon-fleet.origin[1])*fleet.lon_scale/fleet.metres,
     (fleet.origin[0]-trip.lat)*fleet.lat_scale/fleet.metres];
   if(trip.completed)c.mode='arrived';
-  fleet.cabs.push(c);makeLayers([c],select);showPoint(c,c.point);
+  const recordedPoint=[...c.point];
+  if(trip.accepted_point && trip.accepted_point.sequence>c.sequence){
+    const a=trip.accepted_point,resumed=makeCab({...trip,last_sequence:a.sequence,motion:a.motion},network);
+    for(const key of ['mode','index','trail','to','recovery'])c[key]=resumed[key];
+    c.sequence=a.sequence;c.capturedAt=a.captured_at;
+    c.point=[(a.lon-fleet.origin[1])*fleet.lon_scale/fleet.metres,(fleet.origin[0]-a.lat)*fleet.lat_scale/fleet.metres];
+  }
+  fleet.cabs.push(c);makeLayers([c],select);showPoint(c,recordedPoint);
   showCabInRoster(c);
   return c;
 }
 
-async function pollLive(f){
-  if(f!==fleet||f.polling||f.telemetry_mode!=='kafka')return;
+let historyGeneration=0,historyCursor=0;
+async function loadHistory(f,id,append=false){
+  if(!id)return;
+  const generation=++historyGeneration;
+  if(!append){historyCursor=0;$('historyRows').replaceChildren();$('historyStatus').textContent='Loading recorded journey…';}
+  try{
+    const view=await api('me/trips/'+id+'/history?after='+(append?historyCursor:0));
+    if(f!==fleet||id!==selected||generation!==historyGeneration)return;
+    for(const p of view.readings){
+      const row=element('tr');
+      for(const value of [p.sequence,new Date(p.captured_at).toLocaleString(),
+          p.lat.toFixed(5)+', '+p.lon.toFixed(5),Math.round(p.distance_m||0)+' m',
+          p.timestamp_reversed?'Timestamp reversed':p.sequence_gap?'Sequence gap':p.off_route_sample?'Off route':'On route'])row.append(element('td',value));
+      $('historyRows').append(row);
+    }
+    f.historyAlerts ||= {};
+    f.historyAlerts[id]=view.alerts.map(a=>({...a,id:a.event_key||a.id,vehicle_id:f.cabs.find(c=>c.id===id)?.vehicle_id}));
+    render();
+    historyCursor=view.next_after;
+    $('historyMore').hidden=!view.has_more;
+    $('historyStatus').textContent=view.total+' recorded readings · processed through #'+view.processed_sequence+
+      ' · accepted through #'+view.accepted_sequence+' · '+(view.accepted_sequence>view.processed_sequence?'Processing pending':'History caught up')+
+      '. Gaps or reversed timestamps interrupt incident confirmation.';
+  }catch(e){if(f===fleet&&id===selected)$('historyStatus').textContent=e.message;}
+}
+$('historyMore').onclick=()=>loadHistory(fleet,selected,true);
+$('historyRefresh').onclick=()=>loadHistory(fleet,selected);
+async function pollHistory(f){
+  if(f!==fleet||f.polling)return;
   f.polling=true;
   try{
-    const view=await api('me/live');
+    const view=await api('me/trips');
     if(f!==fleet)return;
-    if(view.states.some(s=>!f.cabs.some(c=>c.id===s.trip_id))){
-      const saved=await api('me/trips');
-      if(f!==fleet)return;
-      for(const t of saved.trips)if(!f.cabs.some(c=>c.id===t.id))restoreTrip(t);
-      drawSharedRoads(f.cabs,network);
-    }
-    f.alerts=[...new Map([...f.savedAlerts.filter(a=>a.closed_sequence!==null),...view.alerts].map(a=>[a.id,a])).values()];
-    for(const s of view.states){
-      const c=f.cabs.find(c=>c.id===s.trip_id);
-      if(!c||s.sequence<c.confirmed)continue;
-      c.confirmed=s.sequence;c.offset=s.distance_m||0;c.tracking=s.tracking;
-      c.delayed=s.delayed||s.tracking==='DELAYED';
-      c.displayCapturedAt=s.captured_at;
-      if(s.lat!==null&&s.lat!==undefined){
-        const point=[(s.lon-f.origin[1])*f.lon_scale/f.metres,(f.origin[0]-s.lat)*f.lat_scale/f.metres];
+    f.alerts=view.alerts;
+    if(selected && f.cabs.find(c=>c.id===selected)?.confirmed !== view.trips.find(t=>t.id===selected)?.last_sequence)loadHistory(f,selected);
+    for(const trip of view.trips){
+      let c=f.cabs.find(c=>c.id===trip.id);
+      if(!c){c=restoreTrip(trip);drawSharedRoads(f.cabs,network);}
+      c.confirmed=trip.last_sequence;c.offset=trip.distance_m;c.displayCapturedAt=trip.captured_at;
+      c.liveCompleted=trip.completed;c.delayed=false;
+      if(trip.lat!==null){
+        const point=[(trip.lon-f.origin[1])*f.lon_scale/f.metres,(f.origin[0]-trip.lat)*f.lat_scale/f.metres];
         showPoint(c,point);
-        if(!running&&!f.outbox.length&&!f.working&&s.sequence>c.sequence){
-          const resumed=makeCab({...c,motion:s.motion},network);
-          for(const key of ['mode','index','trail','to','recovery'])c[key]=resumed[key];
-          c.point=point;c.sequence=s.sequence;
-        }
       }
-      c.map.pin.style.opacity=c.delayed?'.45':'1';
-      if(s.completed){c.mode='arrived';c.liveCompleted=true;}
+      if(trip.completed)c.mode='arrived';
     }
-    $('connection').textContent=view.states.some(s=>s.delayed||s.tracking==='DELAYED')?'Some tracking delayed':'● Live tracking';
+    $('connection').textContent=view.trips.some(t=>t.processing_pending)?'Journey history processing':'Recorded history updated';
     cancelAnimationFrame(frame);draw(performance.now());render();
-  }catch(e){
-    if(f===fleet){for(const c of f.cabs){if(c.mode!=='arrived')c.delayed=true;} for(const a of f.alerts)if(a.closed_sequence===null)a.tracking_delayed=true; $('connection').textContent='Tracking delayed';render();}
-  }finally{f.polling=false;if(f===fleet)f.pollTimer=setTimeout(()=>pollLive(f),1000);}
+  }catch(e){if(f===fleet)$('connection').textContent='History unavailable — retrying';}
+  finally{f.polling=false;if(f===fleet)f.pollTimer=setTimeout(()=>pollHistory(f),2000);}
 }
 async function setup(){
   if(changing)return;
@@ -298,10 +320,10 @@ async function setup(){
     drawSharedRoads(fleet.cabs,network);
     selected=(fleet.cabs.find(c=>c.mode!=='arrived')||fleet.cabs.at(-1))?.id;
     if(selected){selectMap(fleet.cabs,selected);draw(performance.now());}
-    $('alerts').textContent='No route alerts in this simulation.';$('review').hidden=true;
+    $('alerts').textContent='No recorded deviations for this trip.';$('review').hidden=true;
     $('connection').textContent='● Ready';
     msg(fleet.cabs.length?'Add a trip or press Start to resume.':'Add a trip to choose a pickup and drop-off.');
-    if(fleet.telemetry_mode==='kafka')pollLive(fleet);
+    pollHistory(fleet);loadHistory(fleet,selected);
   }catch(e){
     msg(e.message+' Try again.');$('connection').textContent='Offline';
     const delay=retryDelay(e,0);
