@@ -99,3 +99,40 @@ class FlatTelemetry(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SeparateProcesses(unittest.IsolatedAsyncioTestCase):
+    async def test_api_starts_producer_without_a_consumer(self):
+        producer=SimpleNamespace(start=AsyncMock(),stop=AsyncMock())
+        with patch.dict('os.environ',{'KAFKA_CREATE_TOPIC':'false'}), \
+             patch('cab_watch.stream.options',return_value={}), \
+             patch('cab_watch.stream.AIOKafkaProducer',return_value=producer), \
+             patch('cab_watch.stream.AIOKafkaConsumer') as consumer:
+            stream=Stream(MagicMock())
+            await stream.start()
+            producer.start.assert_awaited_once()
+            consumer.assert_not_called()
+            self.assertEqual(stream.tasks,[])
+            await stream.stop()
+            producer.stop.assert_awaited_once()
+
+    async def test_worker_starts_consumer_without_a_producer(self):
+        import asyncio
+        consumer=SimpleNamespace(start=AsyncMock(),stop=AsyncMock())
+        async def wait_forever(_):
+            await asyncio.Event().wait()
+        with patch.dict('os.environ',{'KAFKA_CREATE_TOPIC':'false','HISTORY_CONSUMERS':'1'}), \
+             patch('cab_watch.stream.options',return_value={}), \
+             patch('cab_watch.stream.AIOKafkaProducer') as producer, \
+             patch('cab_watch.stream.AIOKafkaConsumer',return_value=consumer) as factory:
+            stream=Stream(MagicMock(),role='consumer')
+            stream.consume=wait_forever
+            await stream.start()
+            await asyncio.sleep(0)
+            producer.assert_not_called()
+            consumer.start.assert_awaited_once()
+            self.assertFalse(factory.call_args.kwargs['enable_auto_commit'])
+            self.assertEqual(len(stream.tasks),1)
+            await stream.stop()
+            consumer.stop.assert_awaited_once()
+            self.assertTrue(stream.tasks[0].cancelled())

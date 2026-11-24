@@ -94,11 +94,32 @@ class KafkaFlow(unittest.TestCase):
         self.assertEqual(URL,'http://127.0.0.1:18082/cab-watch')
         for seq in range(1,4):self.send(seq)
         self.wait(lambda:self.history()['total']==3)
-        compose('restart','dashboard')
+        compose('restart','history-worker')
         self.wait(lambda:self.history()['total']==3,timeout=90)
         self.send(3)
         self.send(4,'H')
         self.wait(lambda:self.history()['total']==4)
         self.assertEqual(len(self.history()['alerts']),1)
+
+    @unittest.skipUnless(os.getenv('CABWATCH_FAULT_TESTS')=='1','Local fault injection disabled')
+    def test_worker_outage_accepts_then_catches_up(self):
+        self.assertEqual(URL,'http://127.0.0.1:18082/cab-watch')
+        compose('stop','history-worker')
+        try:
+            for seq in (1,2,3):
+                p=self.point(seq)
+                p['captured_at']=f'2020-01-01T00:00:0{seq}Z'
+                r=self.client.post('me/gps',json={'readings':[p]})
+                self.assertEqual(r.status_code,202,r.text)
+            time.sleep(1)
+            self.assertEqual(self.history()['total'],0)
+            self.assertEqual(self.history()['accepted_sequence'],3)
+            self.assertEqual(httpx.get(URL.split('/cab-watch')[0]+'/healthz').status_code,200)
+        finally:
+            compose('start','history-worker')
+        self.wait(lambda:self.history()['total']==3,timeout=90)
+        h=self.history()
+        self.assertEqual(len(h['alerts']),1)
+        self.assertEqual(h['alerts'][0]['opened_sequence'],3)
 
 if __name__=='__main__':unittest.main()

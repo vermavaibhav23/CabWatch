@@ -21,7 +21,7 @@ flowchart LR
  SQL --> Dashboard[Recorded journeys and deviations]
 ```
 
-There is no live Kafka group and no Redis dependency. One group named `<topic>.journey-history-v1` runs one consumer per app process by default; `HISTORY_CONSUMERS` changes the worker count within that group. More workers than partitions cannot add partition-reader parallelism. The local broker has one replica, persistent storage and seven-day retention; it is not highly available.
+There is no live Kafka group and no Redis dependency. One group named `<topic>.journey-history-v1` runs one consumer per worker process by default; `HISTORY_CONSUMERS` changes the worker count within that group. More workers than partitions cannot add partition-reader parallelism. The local broker has one replica, persistent storage and seven-day retention; it is not highly available.
 
 Exactly four application tables exist in `cab_watch_accounts`:
 
@@ -53,7 +53,7 @@ The dashboard labels unresolved incidents as open at the last recorded sample, n
 
 ## API
 
-- `GET /healthz`: version `journey-history-v1`, active telemetry mode (liveness only).
+- `GET /healthz`: version `journey-history-v2`, active telemetry mode (liveness only).
 - `POST /cab-watch/me/trips`: create a trip with UUID `Idempotency-Key`.
 - `POST /cab-watch/me/gps`: upload one reading per trip in a batch, maximum 1000.
 - `GET /cab-watch/me/trips`: owned trips, accepted checkpoints, processing status and recent alerts.
@@ -79,3 +79,34 @@ docker compose -p cabwatch-fastapi-test -f compose.yaml -f compose.test.yaml up 
 ```
 
 With the isolated test stack, set `CABWATCH_TEST_DATABASE_URL=postgresql://cabwatch:cabwatch@127.0.0.1:15433/cabwatch` and `CABWATCH_KAFKA_TEST_URL=http://127.0.0.1:18082/cab-watch`, then run `python -m unittest -v test_schema test_kafka_flow`. Optional `CABWATCH_FAULT_TESTS=1` restarts only the test project's application. Never use a production database for tests. CI also checks direct-mode API ownership, late arrivals and deduplication.
+
+
+## Final-year demo: independent producer and consumer
+
+Compose runs FastAPI (`dashboard`) and a separate `history-worker` process. The API only produces Kafka messages; it never consumes them. The worker uses the same image with `python -m cab_watch.worker`, owns the history group, and writes PostgreSQL before committing offsets. Either process can initialize the schema, using the same migration lock. Both require PostgreSQL; this demo proves consumer-outage buffering, not database-independent ingestion.
+
+1. Start the stack: `docker compose up -d --build`.
+2. Open the dashboard, create a trip and start movement.
+3. Run `docker compose stop history-worker`. Continue the simulation. Requests return 202, accepted checkpoints advance, but processed history stays behind.
+4. Inspect the backlog:
+   `docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group cabwatch.gps.recovery.v1.journey-history-v1`
+5. Run `docker compose start history-worker`. Refresh trip history: buffered readings and capture-time deviations appear as the worker catches up.
+6. Run `docker compose restart history-worker` to demonstrate resumption without duplicate readings.
+
+The Kafka offset command may show no group if the worker has never started. Stop/start retains Kafka and PostgreSQL volumes. In direct development mode, stop the history worker before running a direct-mode API. Do not run the previous combined API/consumer release alongside this release if you want the worker-stop demo to pause all consumption.
+
+## Schema compared with the original four-table drawing
+
+This process split requires **no new database migration**. The earlier historical version already added:
+
+| Table | Additional column | Purpose |
+| --- | --- | --- |
+| trips | readings JSONB NOT NULL DEFAULT '{}' | GPS history keyed by sequence; includes calculated distance and evidence flags |
+| trips | history_state JSONB, nullable | Derived confirmation and incident state |
+| trips | accepted_point JSONB, nullable | Latest upload acknowledged to the simulator |
+| trips | processed_at timestamptz, nullable | Actual history processing time |
+| alerts | event_key UUID, nullable, unique index | Stable identity for a recalculated incident |
+| alerts | close_reason TEXT, nullable | Why an incident ended |
+| alerts | historical BOOLEAN NOT NULL DEFAULT false | Distinguishes derived history from preserved legacy alerts |
+
+Users and vehicles are unchanged. Existing primary keys and foreign keys remain. The physical table is named `alerts` (plural). Kafka offsets are stored in Kafka, not in another SQL table. The one-open-alert index is now restricted to legacy (`historical=false`) rows; historical incidents are rebuilt per trip. Old installations with a fifth `telemetry_history` table still use the documented copy-then-drop migration.

@@ -32,11 +32,15 @@ def reading_from_event(event):
 
 
 class Stream:
-    def __init__(self, db):
+    def __init__(self, db, role="producer"):
+        if role not in ("producer", "consumer"):
+            raise ValueError("Stream role must be producer or consumer")
+        self.role = role
         self.db = db
         self.topic = os.getenv('KAFKA_TOPIC', 'cabwatch.gps.recovery.v1')
         self.group = os.getenv('KAFKA_GROUP', self.topic + '.journey-history-v1')
-        self.producer = AIOKafkaProducer(**options(), enable_idempotence=True, acks='all', linger_ms=5)
+        self.producer = (AIOKafkaProducer(**options(), enable_idempotence=True, acks='all', linger_ms=5)
+                         if role == 'producer' else None)
         self.tasks, self.consumers = [], []
 
     async def ingest(self, batch, user):
@@ -125,7 +129,9 @@ class Stream:
                     pass
             finally:
                 await admin.close()
-        await self.producer.start()
+        if self.role == 'producer':
+            await self.producer.start()
+            return
         count=int(os.getenv('HISTORY_CONSUMERS','1'))
         if count<1:
             raise ValueError('HISTORY_CONSUMERS must be positive')
@@ -140,7 +146,8 @@ class Stream:
             task.cancel()
         await asyncio.gather(*self.tasks,return_exceptions=True)
         await asyncio.gather(*(c.stop() for c in self.consumers),return_exceptions=True)
-        await asyncio.wait_for(self.producer.stop(),10)
+        if self.producer is not None:
+            await asyncio.wait_for(self.producer.stop(),10)
 
 @asynccontextmanager
 async def runtime(app):

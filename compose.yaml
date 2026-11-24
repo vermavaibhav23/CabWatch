@@ -26,6 +26,18 @@ services:
     depends_on:
       db: {condition: service_healthy}
       kafka: {condition: service_healthy}
+  history-worker:
+    build: .
+    command: ["python", "-m", "cab_watch.worker"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://cabwatch:cabwatch@db/cabwatch
+      TELEMETRY_MODE: kafka
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      HISTORY_CONSUMERS: ${HISTORY_CONSUMERS:-1}
+    depends_on:
+      db: {condition: service_healthy}
+      kafka: {condition: service_healthy}
   kafka-storage:
     image: alpine:3.21
     user: "0:0"

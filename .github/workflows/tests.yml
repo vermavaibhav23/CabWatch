@@ -23,6 +23,7 @@ jobs:
           CABWATCH_TEST_DATABASE_URL: postgresql://cabwatch:cabwatch@127.0.0.1:15433/cabwatch
           CABWATCH_KAFKA_TEST_URL: http://127.0.0.1:18082/cab-watch
           CABWATCH_FAULT_TESTS: '1'
+      - run: docker compose -p cabwatch-fastapi-test -f compose.yaml -f compose.test.yaml stop history-worker
       - run: docker compose -p cabwatch-fastapi-test -f compose.yaml -f compose.test.yaml up -d --no-deps dashboard
         env:
           TELEMETRY_MODE: direct

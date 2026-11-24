@@ -44,5 +44,5 @@ async def home():
 @app.get("/healthz")
 async def health():
     stream = app.state.pipeline
-    return {"status": "ok", "telemetry_mode": "kafka" if stream else "direct", "version": "journey-history-v1"}
+    return {"status": "ok", "telemetry_mode": "kafka" if stream else "direct", "version": "journey-history-v2", "role": "api"}
 
