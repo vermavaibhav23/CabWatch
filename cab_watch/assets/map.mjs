@@ -47,7 +47,7 @@ export function makeLayers(cabs,choose){
     const updateTitle=()=>{
       const age=Math.max(0,Math.floor((Date.now()-Date.parse(c.displayCapturedAt||c.capturedAt))/1000));
       const when=Number.isFinite(age)?'Position recorded '+Math.floor(age/60)+'m '+age%60+'s ago':'GPS capture time unavailable';
-      title.textContent=c.vehicle_id+' · '+c.origin+' to '+c.destination+' · '+when;
+      title.textContent=c.vehicle_id+(c.offRoute?' · OFF ROUTE':'')+' · '+c.origin+' to '+c.destination+' · '+when;
       pin.setAttribute('aria-label',title.textContent);
     };
     pin.addEventListener('pointerenter',updateTitle);

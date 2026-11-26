@@ -19,3 +19,14 @@
 .account label{display:grid;gap:4px}.account input{font:inherit;padding:9px;border-radius:7px;border:1px solid #bfcdcd}
 .accountbar{display:flex;justify-content:flex-end;align-items:center;gap:12px;padding-top:12px}
 [hidden]{display:none!important}
+
+/* Confirmed server-side incidents, with a static reduced-motion alternative. */
+.cabrow.alarm {border:2px solid #c52232;background:#fff0f1;box-shadow:0 0 12px #e3274566;animation:offroute-glow 1.6s ease-in-out infinite alternate}
+.cabrow.alarm .badge {background:#b5192b;color:white;font-weight:800}
+.cabrow.alarm .desc,.offroute-details {color:#a81124;font-weight:700}
+.offroute-details {padding:10px;background:#fff0f1;border-left:4px solid #c52232}
+.cabpin.offroute {filter:drop-shadow(0 0 7px #e32745)}
+.cabpin.offroute rect {fill:#cf1730;stroke:#fff;stroke-width:2}
+.cabpin.offroute circle {visibility:visible;stroke:#cf1730;stroke-width:3}
+@keyframes offroute-glow {from {box-shadow:0 0 5px #e3274533} to {box-shadow:0 0 16px #e3274588}}
+@media (prefers-reduced-motion:reduce) {.cabrow.alarm {animation:none}}

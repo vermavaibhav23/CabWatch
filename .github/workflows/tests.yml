@@ -18,7 +18,7 @@ jobs:
       - run: python -m unittest -v test_cab_watch test_retention test_telemetry test_live test_journey test_stream
       - run: node --test test_motion.mjs test_telemetry.mjs
       - run: docker compose -p cabwatch-fastapi-test -f compose.yaml -f compose.test.yaml up -d --build
-      - run: python -m unittest -v test_schema test_kafka_flow
+      - run: python -m unittest -v test_schema test_kafka_flow test_notifications
         env:
           CABWATCH_TEST_DATABASE_URL: postgresql://cabwatch:cabwatch@127.0.0.1:15433/cabwatch
           CABWATCH_KAFKA_TEST_URL: http://127.0.0.1:18082/cab-watch

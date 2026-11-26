@@ -19,6 +19,8 @@ services:
       DATABASE_URL: postgresql://cabwatch:cabwatch@db/cabwatch
       TELEMETRY_MODE: ${TELEMETRY_MODE:-kafka}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-cabwatch.gps.v2}
+      KAFKA_PARTITIONS: 3
       METRICS_TOKEN: ${METRICS_TOKEN:-local-development-only}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       TRIP_RETENTION_DAYS: ${TRIP_RETENTION_DAYS:-90}
@@ -34,7 +36,9 @@ services:
       DATABASE_URL: postgresql://cabwatch:cabwatch@db/cabwatch
       TELEMETRY_MODE: kafka
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      HISTORY_CONSUMERS: ${HISTORY_CONSUMERS:-1}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-cabwatch.gps.v2}
+      KAFKA_PARTITIONS: 3
+      HISTORY_CONSUMERS: ${HISTORY_CONSUMERS:-3}
     depends_on:
       db: {condition: service_healthy}
       kafka: {condition: service_healthy}

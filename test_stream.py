@@ -136,3 +136,26 @@ class SeparateProcesses(unittest.IsolatedAsyncioTestCase):
             await stream.stop()
             consumer.stop.assert_awaited_once()
             self.assertTrue(stream.tasks[0].cancelled())
+
+
+class ThreeConsumers(unittest.IsolatedAsyncioTestCase):
+    async def test_default_worker_has_three_independent_clients(self):
+        import asyncio
+        clients=[]
+        def make(*args,**kwargs):
+            client=SimpleNamespace(start=AsyncMock(),stop=AsyncMock())
+            clients.append(client)
+            return client
+        async def wait_forever(client):
+            await asyncio.Event().wait()
+        with patch.dict('os.environ',{'KAFKA_CREATE_TOPIC':'false','HISTORY_CONSUMERS':'3','KAFKA_BOOTSTRAP_SERVERS':'unused:9092'}), \
+             patch('cab_watch.stream.AIOKafkaConsumer',side_effect=make):
+            stream=Stream(MagicMock(),role='consumer')
+            stream.consume=wait_forever
+            await stream.start()
+            self.assertEqual(len(clients),3)
+            self.assertEqual(len(stream.tasks),3)
+            await stream.stop()
+            for client in clients:
+                client.start.assert_awaited_once()
+                client.stop.assert_awaited_once()

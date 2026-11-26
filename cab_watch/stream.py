@@ -37,7 +37,7 @@ class Stream:
             raise ValueError("Stream role must be producer or consumer")
         self.role = role
         self.db = db
-        self.topic = os.getenv('KAFKA_TOPIC', 'cabwatch.gps.recovery.v1')
+        self.topic = os.getenv('KAFKA_TOPIC', 'cabwatch.gps.v2')
         self.group = os.getenv('KAFKA_GROUP', self.topic + '.journey-history-v1')
         self.producer = (AIOKafkaProducer(**options(), enable_idempotence=True, acks='all', linger_ms=5)
                          if role == 'producer' else None)
@@ -124,15 +124,19 @@ class Stream:
             await admin.start()
             try:
                 try:
-                    await admin.create_topics([NewTopic(self.topic,int(os.getenv('KAFKA_PARTITIONS','12')),int(os.getenv('KAFKA_REPLICATION_FACTOR','1')))])
+                    await admin.create_topics([NewTopic(self.topic,int(os.getenv('KAFKA_PARTITIONS','3')),int(os.getenv('KAFKA_REPLICATION_FACTOR','1')))])
                 except TopicAlreadyExistsError:
                     pass
+                metadata = await admin.describe_topics([self.topic])
+                expected = int(os.getenv('KAFKA_PARTITIONS', '3'))
+                if not metadata or metadata[0].get('error_code', 0) or len(metadata[0]['partitions']) != expected:
+                    raise ValueError('Kafka topic partition count differs from KAFKA_PARTITIONS; use a new topic or complete the documented cutover')
             finally:
                 await admin.close()
         if self.role == 'producer':
             await self.producer.start()
             return
-        count=int(os.getenv('HISTORY_CONSUMERS','1'))
+        count=int(os.getenv('HISTORY_CONSUMERS','3'))
         if count<1:
             raise ValueError('HISTORY_CONSUMERS must be positive')
         for _ in range(count):

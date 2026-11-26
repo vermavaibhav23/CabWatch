@@ -77,3 +77,7 @@ async def persist_readings(conn, trip_id, incoming):
     if completed:
         await conn.execute("""UPDATE cab_watch_accounts.vehicles SET status='available' WHERE id=$1
             AND NOT EXISTS(SELECT FROM cab_watch_accounts.trips WHERE vehicle_id=$1 AND completed_at IS NULL)""",trip['vehicle_id'])
+
+    # PostgreSQL delivers NOTIFY only after this transaction commits.
+    # Payload is just a routing hint; WebSockets read authorized durable state.
+    await conn.execute("SELECT pg_notify('cabwatch_journey', $1)", str(trip['user_id']))

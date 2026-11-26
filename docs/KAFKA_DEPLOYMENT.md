@@ -1,3 +1,5 @@
+> For the new 3-partition topic and WebSocket release, follow the [topic cutover instructions](../README.md#upgrade-an-existing-12-partition-installation) first. Earlier migration notes below describe the historical schema rollout.
+
 # Journey-history cutover
 
 This changes the application to one historical Kafka consumer group and four PostgreSQL tables. It does not provision hosting or automatically switch a running service. Existing Render auto-deploy settings may deploy a push to main; coordinate the following before enabling the new code against production.

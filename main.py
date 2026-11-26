@@ -27,6 +27,8 @@ async def lifespan(app):
             await stack.enter_async_context(runtime(app))
         elif mode != "direct":
             raise ValueError("TELEMETRY_MODE must be direct or kafka")
+        from cab_watch.notifications import runtime as notifications_runtime
+        await stack.enter_async_context(notifications_runtime(app))
         yield
 
 

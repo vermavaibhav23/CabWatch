@@ -26,6 +26,8 @@ from .fleet import router as fleet_router
 
 router.include_router(auth_router)
 router.include_router(fleet_router)
+from .notifications import router as notifications_router
+router.include_router(notifications_router)
 
 Node = Annotated[str, Field(pattern="^[A-Z]$")]
 

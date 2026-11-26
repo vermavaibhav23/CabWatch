@@ -1,6 +1,6 @@
 # CabWatch journey history
 
-CabWatch simulates cab/delivery journeys and records GPS deviations from planned routes. It is a historical audit tool, not a real-time alerting service. The map shows the latest **processed** reading; processing can lag behind GPS uploads.
+CabWatch simulates cab/delivery journeys and records GPS deviations from planned routes. It records journey history and pushes confirmed off-route status to the dashboard over a WebSocket. The map shows the latest **processed** reading; processing can lag behind GPS uploads.
 
 ## Run
 
@@ -15,13 +15,13 @@ Open http://localhost:18080/cab-watch/. Register, add a trip, and start the simu
 ```mermaid
 flowchart LR
  Browser[Browser GPS] --> API[FastAPI validation]
- API -->|key = vehicle ID| Kafka[GPS topic: 12 partitions]
+ API -->|key = vehicle ID| Kafka[GPS topic: 3 partitions]
  Kafka --> Worker[Journey history consumer group]
  Worker -->|one SQL transaction| SQL[(PostgreSQL)]
  SQL --> Dashboard[Recorded journeys and deviations]
 ```
 
-There is no live Kafka group and no Redis dependency. One group named `<topic>.journey-history-v1` runs one consumer per worker process by default; `HISTORY_CONSUMERS` changes the worker count within that group. More workers than partitions cannot add partition-reader parallelism. The local broker has one replica, persistent storage and seven-day retention; it is not highly available.
+There is no live Kafka group and no Redis dependency. One group named `<topic>.journey-history-v1` runs three consumer clients in one worker process by default (one partition each after assignment settles); `HISTORY_CONSUMERS` changes the worker count within that group. More workers than partitions cannot add partition-reader parallelism. The local broker has one replica, persistent storage and seven-day retention; it is not highly available.
 
 Exactly four application tables exist in `cab_watch_accounts`:
 
@@ -89,7 +89,7 @@ Compose runs FastAPI (`dashboard`) and a separate `history-worker` process. The 
 2. Open the dashboard, create a trip and start movement.
 3. Run `docker compose stop history-worker`. Continue the simulation. Requests return 202, accepted checkpoints advance, but processed history stays behind.
 4. Inspect the backlog:
-   `docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group cabwatch.gps.recovery.v1.journey-history-v1`
+   `docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group cabwatch.gps.v2.journey-history-v1`
 5. Run `docker compose start history-worker`. Refresh trip history: buffered readings and capture-time deviations appear as the worker catches up.
 6. Run `docker compose restart history-worker` to demonstrate resumption without duplicate readings.
 
@@ -110,3 +110,45 @@ This process split requires **no new database migration**. The earlier historica
 | alerts | historical BOOLEAN NOT NULL DEFAULT false | Distinguishes derived history from preserved legacy alerts |
 
 Users and vehicles are unchanged. Existing primary keys and foreign keys remain. The physical table is named `alerts` (plural). Kafka offsets are stored in Kafka, not in another SQL table. The one-open-alert index is now restricted to legacy (`historical=false`) rows; historical incidents are rebuilt per trip. Old installations with a fifth `telemetry_history` table still use the documented copy-then-drop migration.
+
+## WebSocket off-route alerts and three partitions
+
+The default application topic is now `cabwatch.gps.v2`, with **3 partitions** and
+**3 consumers** in the existing history group. Run one `history-worker` service;
+its three async consumer tasks share a process (they are not three CPU processes).
+Kafka assigns one partition to each while all three are healthy; on a failure,
+surviving consumers take over. Vehicle ID remains the record key.
+
+The detector still requires three consecutive readings at least 200 m off route.
+After saving each changed journey, it calls PostgreSQL `pg_notify` inside the SQL
+transaction. PostgreSQL delivers that signal only on commit. FastAPI has one
+LISTEN connection and wakes the signed-in user's WebSockets. It reads the latest
+committed state and sends `off_route_snapshot` to `/cab-watch/me/alerts/ws`.
+The first client frame is `{"token":"<access token>"}`; tokens never go in URLs.
+The server verifies the token on connect and again before each snapshot.
+No Redis, second Kafka group, extra table, or schema migration is introduced.
+
+An active incident turns the vehicle marker and roster red with a glowing border,
+an OFF ROUTE badge, measured distance, sequence and capture time. Returning to the
+route or completing the trip clears it. A snapshot on reconnect and every five
+seconds restores state after missed notifications; these are current processed
+states, not a guaranteed delivery stream of every intermediate alert transition.
+The history table retains those incidents. A disconnected socket falls back to
+roster polling and reconnects. WebSocket delivery does not remove Kafka backlog:
+old readings retain their capture time and are never represented as current GPS.
+
+### Upgrade an existing 12-partition installation
+
+Kafka cannot reduce an existing topic's partition count. Do not delete its data.
+Before deploying this release, pause all browser simulators/uploads, let the old
+worker drain `cabwatch.gps.recovery.v1` until group lag is zero, then stop the old
+API and worker. Deploy this release with `docker compose up -d --build` and resume
+uploads. The new topic/group start empty; existing PostgreSQL history is retained.
+Keep the old topic for recovery until its records are no longer needed.
+
+If already switched before draining: pause uploads, stop the new worker, and run
+`docker compose run --rm -e KAFKA_TOPIC=cabwatch.gps.recovery.v1 -e KAFKA_PARTITIONS=12 history-worker`
+until the old group has zero lag, stop that temporary worker, then start the normal
+worker and resume. Never run old/new-topic workers concurrently during cutover.
+On a fresh install only the new three-partition application topic is created.
+Kafka's internal offset topic is separate and must not be resized.

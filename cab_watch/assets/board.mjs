@@ -1,6 +1,6 @@
 import {TelemetryOutbox,retryDelay} from './telemetry.mjs?v=route2';
 import {makeCab,motionSnapshot,divert,rejoin,advance} from './motion.mjs?v=retrace1';
-import {cityMap,makeLayers,drawSharedRoads,selectMap,showPoint,animate} from './map.mjs?v=kafka1';
+import {cityMap,makeLayers,drawSharedRoads,selectMap,showPoint,animate} from './map.mjs?v=alerts1';
 
 const $=id=>document.getElementById(id);
 const colors=[
@@ -32,7 +32,7 @@ async function api(path,method='GET',body,extraHeaders={}){
 }
 function chosen(){return fleet?.cabs.find(c=>c.id===selected);}
 function select(id){selected=id;selectMap(fleet.cabs,id);render();loadHistory(fleet,id);}
-function alertFor(c){return fleet.alerts.find(a=>a.trip_id===c.id&&a.closed_sequence===null&&!a.tracking_delayed&&!c.delayed);}
+function alertFor(c){if(fleet.socketStates)return fleet.socketStates[c.id]?.alert;return fleet.alerts.find(a=>a.trip_id===c.id&&a.closed_sequence===null&&!a.tracking_delayed&&!c.delayed);}
 
 
 function render(){
@@ -43,7 +43,7 @@ function render(){
   }
   $('clock').textContent=[Math.floor(fleet.seconds/60),fleet.seconds%60].map(s=>String(s).padStart(2,'0')).join(':');
   $('total').textContent=fleet.cabs.filter(c=>c.mode!=='arrived').length;
-  $('open').textContent=fleet.alerts.filter(a=>a.closed_sequence===null&&!a.tracking_delayed&&!fleet.cabs.find(c=>c.id===a.trip_id)?.delayed).length;
+  $('open').textContent=fleet.cabs.filter(c=>alertFor(c)).length;
   const moving=fleet.cabs.some(c=>c.mode!=='arrived');
   $('mode').textContent=running?'● Running':moving?'Paused':'Ready';
   $('play').textContent=running?'Ⅱ Pause':'▶ Start';
@@ -53,19 +53,26 @@ function render(){
     c.row.setAttribute('aria-pressed',String(c.id===selected));
     const alarm=alertFor(c);
     c.row.classList.toggle('alarm',Boolean(alarm));
-    c.badge.textContent=c.confirmed<c.sequence?'History processing':alarm?'Deviation in last record':c.mode==='turn requested'?'Turn queued':
+    c.map.pin.classList.toggle('offroute',Boolean(alarm));
+    c.offRoute=Boolean(alarm);
+    c.badge.textContent=alarm?'OFF ROUTE':c.confirmed<c.sequence?'History processing':c.mode==='turn requested'?'Turn queued':
       c.mode==='detour'?'Route changed':stage(c);
-    c.desc.textContent=c.origin+' → '+c.destination;
+    const evidence=fleet.socketStates?.[c.id];
+    c.desc.textContent=alarm?Math.round(evidence?.distance_m??c.offset)+' m from route · GPS #'+(evidence?.sequence??c.confirmed)+' · Captured '+new Date(evidence?.captured_at??c.displayCapturedAt).toLocaleTimeString():c.origin+' → '+c.destination;
   }
   const c=chosen();
   if(!c){
     $('selected').textContent='Select a cab';$('tripline').textContent='Choose pickup and drop-off to start a trip.';
+    $('distance').classList.remove('offroute-details');
     $('distance').textContent='';$('wrong').disabled=true;$('return').disabled=true;
   }else{
     $('selected').textContent=c.vehicle_id+' · '+c.origin+' → '+c.destination;
     $('tripline').textContent=c.origin+' → '+c.destination+' · '+(c.metres/1000).toFixed(2)+' km · '+stage(c);
-    $('distance').textContent=Math.round(c.offset)+' m from planned route · GPS #'+c.confirmed+
-      ' · Recorded '+(c.displayCapturedAt?new Date(c.displayCapturedAt).toLocaleString():'not yet')+' · Historical confirmation: 3 consecutive readings';
+    const evidence=fleet.socketStates?.[c.id];
+    const captured=evidence?.captured_at??c.displayCapturedAt;
+    $('distance').classList.toggle('offroute-details',Boolean(alertFor(c)));
+    $('distance').textContent=(alertFor(c)?'OFF ROUTE · ':'')+Math.round(fleet.socketStates?.[c.id]?.distance_m??c.offset)+' m from planned route · GPS #'+(evidence?.sequence??c.confirmed)+
+      ' · Recorded '+(captured?new Date(captured).toLocaleString():'not yet')+' · Historical confirmation: 3 consecutive readings';
     $('wrong').disabled=changing||c.mode!=='route'||c.index+1>=c.route.length-1;
     $('return').disabled=changing||!['detour','turn requested'].includes(c.mode);
   }
@@ -289,6 +296,33 @@ async function pollHistory(f){
   }catch(e){if(f===fleet)$('connection').textContent='History unavailable — retrying';}
   finally{f.polling=false;if(f===fleet)f.pollTimer=setTimeout(()=>pollHistory(f),2000);}
 }
+function stopAlertSocket(f){
+  if(!f)return;
+  clearTimeout(f.socketRetry);f.socketStopped=true;f.socket?.close();
+}
+function connectAlerts(f){
+  if(f!==fleet||f.socketStopped)return;
+  const socket=f.socket=new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/cab-watch/me/alerts/ws');
+  socket.onopen=()=>socket.send(JSON.stringify({token:sessionStorage.getItem('cabwatch.token')}));
+  socket.onmessage=event=>{
+    if(f!==fleet||f.socket!==socket)return;
+    const message=JSON.parse(event.data);
+    if(message.type!=='off_route_snapshot')return;
+    f.socketStates=Object.fromEntries(message.vehicles.map(v=>[v.trip_id,v]));
+    $('alertConnection').textContent='● Alert updates connected · status at captured reading';
+    render();
+  };
+  socket.onclose=event=>{
+    if(f!==fleet||f.socketStopped)return;
+    f.socketStates=null;
+    $('alertConnection').textContent='Alert connection lost · using recorded history · reconnecting';
+    render();
+    if(event.code===4401){signOut('Please sign in again.');return;}
+    f.socketRetry=setTimeout(()=>connectAlerts(f),1500);
+  };
+  socket.onerror=()=>socket.close();
+}
+
 async function setup(){
   if(changing)return;
   changing=true;
@@ -308,6 +342,7 @@ async function setup(){
     const created=await api('me/trips');
     running=false;clearTimeout(timer);cancelAnimationFrame(frame);reviewGeneration++;selected=null;closePlanner();
     clearTimeout(fleet?.retryTimer);clearTimeout(fleet?.pollTimer);
+    stopAlertSocket(fleet);
     fleet={outbox,...network,...created,savedAlerts:created.alerts,cabs:[],seconds:0,working:false};
     cityMap(network,pick);closePlanner();
     for(const id of ['routes','shared','pins'])$(id).replaceChildren();
@@ -323,7 +358,7 @@ async function setup(){
     $('alerts').textContent='No recorded deviations for this trip.';$('review').hidden=true;
     $('connection').textContent='● Ready';
     msg(fleet.cabs.length?'Add a trip or press Start to resume.':'Add a trip to choose a pickup and drop-off.');
-    pollHistory(fleet);loadHistory(fleet,selected);
+    connectAlerts(fleet);pollHistory(fleet);loadHistory(fleet,selected);
   }catch(e){
     msg(e.message+' Try again.');$('connection').textContent='Offline';
     const delay=retryDelay(e,0);
@@ -345,6 +380,7 @@ $('return').onclick=()=>{rejoin(chosen());render();
   msg(running?'Cab is retracing its detour.':'Return requested. Press Start to drive.');};
 let registering=false;
 function signOut(message=''){
+  stopAlertSocket(fleet);
   sessionStorage.removeItem('cabwatch.token');sessionStorage.removeItem('cabwatch.name');
   clearTimeout(fleet?.retryTimer);clearTimeout(fleet?.pollTimer);fleet=null;running=false;selected=null;clearTimeout(timer);cancelAnimationFrame(frame);
   $('dashboard').hidden=true;$('account').hidden=false;$('authMessage').textContent=message;

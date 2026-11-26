@@ -33,10 +33,18 @@ with httpx.Client(timeout=20) as client:
             assert r.status_code in (200,202),r.text
             page.wait_for_function('(seq)=>document.querySelector("#distance").textContent.includes("GPS #"+seq)',arg=seq)
         for seq in (1,2,3):reading(seq)
-        page.get_by_text('Deviation in last record',exact=True).wait_for()
+        page.get_by_text('OFF ROUTE',exact=True).wait_for()
+        page.locator('.cabpin.offroute').wait_for()
+        page.locator('.cabrow.alarm').wait_for()
+        assert 'connected' in page.locator('#alertConnection').inner_text()
+        page.screenshot(path=str(Path(os.environ.get('CABWATCH_QA_OUTPUT','browser-smoke.png')).with_name('offroute-dashboard.png')),full_page=True)
         assert page.locator('#open').inner_text()=='1'
+        page.reload(wait_until='networkidle')
+        page.locator('.cabpin.offroute').wait_for()
         reading(4,'H')
         page.wait_for_function('document.querySelector("#open").textContent === "0"')
+        assert page.locator('.cabpin.offroute').count()==0
+        assert page.locator('.cabrow.alarm').count()==0
         page.locator('#historyRefresh').click()
         page.wait_for_function('document.querySelectorAll("#historyRows tr").length === 4')
         assert '2020' in page.locator('#historyRows').inner_text()

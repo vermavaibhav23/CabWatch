@@ -68,6 +68,23 @@ class KafkaFlow(unittest.TestCase):
     def history(self):
         r=self.client.get(f"me/trips/{self.trip}/history");r.raise_for_status();return r.json()
 
+    @unittest.skipUnless(os.getenv('CABWATCH_FAULT_TESTS')=='1', 'Requires isolated Docker test stack')
+    def test_three_partitions_have_three_active_consumers(self):
+        def command(*args):
+            return subprocess.check_output(['docker','compose','-p','cabwatch-fastapi-test',
+                '-f','compose.yaml','-f','compose.test.yaml','exec','-T','kafka',*args],
+                cwd=ROOT,text=True,timeout=30)
+        description=command('/opt/kafka/bin/kafka-topics.sh','--bootstrap-server','localhost:9092',
+                            '--describe','--topic','cabwatch.gps.v2')
+        self.assertIn('PartitionCount: 3',description)
+        def assigned():
+            output=command('/opt/kafka/bin/kafka-consumer-groups.sh','--bootstrap-server','localhost:9092',
+                           '--describe','--group','cabwatch.gps.v2.journey-history-v1')
+            rows=[line.split() for line in output.splitlines()
+                  if line.startswith('cabwatch.gps.v2.journey-history-v1')]
+            return len(rows)==3 and len({row[6] for row in rows if row[6]!='-'})==3
+        self.wait(assigned,timeout=60)
+
     def test_late_backlog_replay_and_completion(self):
         # Old capture times are intentional: history must not depend on wall-clock freshness.
         def send(seq,node='D'):
