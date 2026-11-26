@@ -1,76 +1,35 @@
-"""Recovery invariants, independent of brokers and wall-clock timing."""
+"""Incremental continuity rules, independent of Kafka fetch timing."""
 import unittest
-from uuid import uuid4
+from datetime import datetime, timezone
+from cab_watch.journey import evaluate
 from cab_watch import city
-from cab_watch.live import advance, stamp
 
-class LiveRecovery(unittest.TestCase):
+class IncrementalRules(unittest.TestCase):
     def setUp(self):
-        self.trip = str(uuid4())
-        self.user = str(uuid4())
-        self.now = 1800000000000
-        self.state = None
-
-    def sample(self, seq, node="D", age=0, capture=None):
-        lat, lon = city.gps(city.NODES[node])
-        self.now += 1000
-        event = dict(trip_id=self.trip, user_id=self.user, vehicle_id="CB#001", route=["G","H","I","J","K"],
-                     point=dict(sequence=seq, captured_at=stamp(capture or self.now-age), lat=lat, lon=lon, motion=None))
-        self.state, changes = advance(self.state, event, self.now)
-        return changes
-
-    def test_three_fresh_readings_then_resolve(self):
-        self.sample(1); self.assertFalse(self.state["off_route"])
-        self.sample(2); self.assertEqual(self.state["tracking"], "CONFIRMING")
-        changes=self.sample(3)
-        self.assertTrue(self.state["off_route"])
-        self.assertEqual(changes[0]["confirming_capture"], self.state["captured_at"])
-        self.sample(4,"H")
-        self.assertFalse(self.state["off_route"])
-        self.assertEqual(self.state["recent"][0]["close_reason"], "returned to route")
-
-    def test_stale_reading_resets_and_preserves_last_fresh_position(self):
-        self.sample(1); self.sample(2); self.sample(3)
-        before = self.state["captured_at"]
-        self.sample(4,"Z",age=300000)
-        self.assertEqual(self.state["tracking"], "DELAYED")
-        self.assertEqual(self.state["captured_at"], before)
-        self.assertEqual(self.state["consecutive"], 0)
-        self.sample(5); self.sample(6)
-        self.assertFalse(self.state["off_route"])
-        self.sample(7)
-        self.assertTrue(self.state["off_route"])
-        self.assertEqual(self.state["alert"]["opened_sequence"], 7)
-
-    def test_missing_sequence_and_time_gap_reset_confirmation(self):
-        self.sample(1); self.sample(2); self.sample(4)
-        self.assertEqual(self.state["consecutive"], 1)
-        self.sample(5)
-        self.now += 20000
-        self.sample(6)
-        self.assertEqual(self.state["consecutive"], 1)
-        self.assertFalse(self.state["off_route"])
-
-    def test_duplicate_and_old_sequence_are_noops(self):
-        self.sample(10); old=self.state
-        self.assertEqual(self.sample(10,"H"), [])
-        self.assertIs(self.state,old)
-        self.sample(9); self.assertIs(self.state,old)
-
-    def test_reversed_timestamp_resets_and_future_is_not_live(self):
-        self.sample(1); self.sample(2)
-        self.sample(3,capture=self.now-500)
-        self.assertEqual(self.state["tracking"], "DELAYED")
-        self.sample(4,age=-4000)
-        self.assertEqual(self.state["consecutive"], 0)
-
-    def test_completion_is_terminal_and_stale_arrival_is_not_completion(self):
-        self.sample(1,"K",age=300000)
-        self.assertFalse(self.state["completed"])
-        changes=self.sample(2,"K")
-        self.assertTrue(self.state["completed"])
-        self.assertEqual(changes[-1]["kind"], "complete")
-        old=self.state; self.sample(3)
-        self.assertIs(self.state,old)
-
-if __name__ == "__main__": unittest.main()
+        self.trip=dict(planned_route=['G','H','I','J','K'],last_sequence=0,last_captured_at=None,off_route_count=0)
+    def apply(self,seq,node='D',second=None):
+        lat,lon=city.gps(city.NODES[node])
+        p=dict(sequence=seq,lat=lat,lon=lon,captured_at=f'2020-01-01T00:00:{second if second is not None else seq:02d}Z')
+        r=evaluate(self.trip,p)
+        self.trip.update(last_sequence=seq,off_route_count=r['count'])
+        if r['valid']:self.trip['last_captured_at']=r['captured']
+        return r
+    def test_three_then_return(self):
+        self.assertEqual([self.apply(i)['count'] for i in (1,2,3,4)],[1,2,3,3])
+        self.assertEqual(self.apply(5,'H')['count'],0)
+    def test_gap_restarts_confirmation(self):
+        self.apply(1);self.apply(2)
+        self.assertEqual(self.apply(4)['count'],1)
+        self.assertEqual(self.apply(5)['count'],2)
+    def test_time_gap_and_reversal(self):
+        self.apply(1);self.apply(2)
+        self.assertEqual(self.apply(3,second=20)['count'],1)
+        self.assertFalse(self.apply(4,second=19)['valid'])
+        self.assertEqual(self.apply(5,second=21)['count'],1)
+    def test_destination_needs_only_coordinates(self):
+        result=self.apply(1,'K')
+        self.assertTrue(result['completed']);self.assertEqual(result['count'],0)
+    def test_invalid_time_cannot_confirm(self):
+        lat,lon=city.gps(city.NODES['D'])
+        for timestamp in ('broken','2020-01-01T00:00:00','2999-01-01T00:00:00Z'):
+            self.assertFalse(evaluate(self.trip,dict(sequence=1,lat=lat,lon=lon,captured_at=timestamp))['valid'])

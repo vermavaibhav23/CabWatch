@@ -1,4 +1,4 @@
-import {TelemetryOutbox,retryDelay} from './telemetry.mjs?v=route2';
+import {TelemetryOutbox,retryDelay} from './telemetry.mjs?v=incremental1';
 import {makeCab,motionSnapshot,divert,rejoin,advance} from './motion.mjs?v=retrace1';
 import {cityMap,makeLayers,drawSharedRoads,selectMap,showPoint,animate} from './map.mjs?v=alerts1';
 
@@ -9,7 +9,7 @@ const colors=[
     "#38578c", "#885a0b", "#426d57", "#804991", "#2d7782", "#8c5436",
     "#536aaf", "#923b32",
 ];
-const stage=c=>c.mode==='arrived'?(fleet?.telemetry_mode==='kafka'&&!c.liveCompleted?'Awaiting history processing':'Completed'):'With customer';
+const stage=c=>c.liveCompleted?'Completed':!c.resumable?'Display only · local session unavailable':c.mode==='arrived'?'Arrival queued for processing':'Locally resumable';
 let fleet,selected,running=false,frame,timer,changing=false,reviewGeneration=0,network,dispatchKey;
 const msg=text=>{$('message').textContent=text;};
 const element=(tag,text,cls)=>{const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e;};
@@ -31,7 +31,7 @@ async function api(path,method='GET',body,extraHeaders={}){
   return response.json();
 }
 function chosen(){return fleet?.cabs.find(c=>c.id===selected);}
-function select(id){selected=id;selectMap(fleet.cabs,id);render();loadHistory(fleet,id);}
+function select(id){selected=id;selectMap(fleet.cabs,id);render();loadAlerts(fleet,id);}
 function alertFor(c){if(fleet.socketStates)return fleet.socketStates[c.id]?.alert;return fleet.alerts.find(a=>a.trip_id===c.id&&a.closed_sequence===null&&!a.tracking_delayed&&!c.delayed);}
 
 
@@ -42,9 +42,9 @@ function render(){
     return;
   }
   $('clock').textContent=[Math.floor(fleet.seconds/60),fleet.seconds%60].map(s=>String(s).padStart(2,'0')).join(':');
-  $('total').textContent=fleet.cabs.filter(c=>c.mode!=='arrived').length;
+  $('total').textContent=fleet.cabs.filter(c=>!c.liveCompleted).length;
   $('open').textContent=fleet.cabs.filter(c=>alertFor(c)).length;
-  const moving=fleet.cabs.some(c=>c.mode!=='arrived');
+  const moving=fleet.cabs.some(c=>c.resumable&&c.mode!=='arrived');
   $('mode').textContent=running?'● Running':moving?'Paused':'Ready';
   $('play').textContent=running?'Ⅱ Pause':'▶ Start';
   $('play').disabled=changing||(!moving&&!fleet.outbox?.length);
@@ -55,7 +55,7 @@ function render(){
     c.row.classList.toggle('alarm',Boolean(alarm));
     c.map.pin.classList.toggle('offroute',Boolean(alarm));
     c.offRoute=Boolean(alarm);
-    c.badge.textContent=alarm?'OFF ROUTE':c.confirmed<c.sequence?'History processing':c.mode==='turn requested'?'Turn queued':
+    c.badge.textContent=alarm?'OFF ROUTE':c.resumable&&c.confirmed<c.sequence?'GPS processing':c.mode==='turn requested'?'Turn queued':
       c.mode==='detour'?'Route changed':stage(c);
     const evidence=fleet.socketStates?.[c.id];
     c.desc.textContent=alarm?Math.round(evidence?.distance_m??c.offset)+' m from route · GPS #'+(evidence?.sequence??c.confirmed)+' · Captured '+new Date(evidence?.captured_at??c.displayCapturedAt).toLocaleTimeString():c.origin+' → '+c.destination;
@@ -72,18 +72,18 @@ function render(){
     const captured=evidence?.captured_at??c.displayCapturedAt;
     $('distance').classList.toggle('offroute-details',Boolean(alertFor(c)));
     $('distance').textContent=(alertFor(c)?'OFF ROUTE · ':'')+Math.round(fleet.socketStates?.[c.id]?.distance_m??c.offset)+' m from planned route · GPS #'+(evidence?.sequence??c.confirmed)+
-      ' · Recorded '+(captured?new Date(captured).toLocaleString():'not yet')+' · Historical confirmation: 3 consecutive readings';
-    $('wrong').disabled=changing||c.mode!=='route'||c.index+1>=c.route.length-1;
-    $('return').disabled=changing||!['detour','turn requested'].includes(c.mode);
+      ' · Recorded '+(captured?new Date(captured).toLocaleString():'not yet')+' · Confirmation: 3 consecutive readings';
+    $('wrong').disabled=changing||!c.resumable||c.mode!=='route'||c.index+1>=c.route.length-1;
+    $('return').disabled=changing||!c.resumable||!['detour','turn requested'].includes(c.mode);
   }
-  const selectedAlerts=fleet.historyAlerts?.[selected]||fleet.alerts.filter(a=>a.trip_id===selected);
+  const selectedAlerts=fleet.incidents?.[selected]||fleet.alerts.filter(a=>a.trip_id===selected);
   const logKey=JSON.stringify([selected,selectedAlerts.map(a=>[a.id,a.closed_sequence,a.tracking_delayed,Math.round(a.peak_metres)])]);
   if(logKey!==fleet.logKey){
     fleet.logKey=logKey;const log=$('alerts');log.replaceChildren();
     if(!selectedAlerts.length)log.append(element('p','No recorded deviations for this trip.','muted'));
     for(const a of selectedAlerts){
       const row=element('div',undefined,'logrow'),info=element('div');
-      info.append(element('strong',a.vehicle_id+(a.historical===false?' · Legacy record':'')+' · '+(a.tracking_delayed?'Tracking delayed':a.closed_sequence?(a.close_reason||'Resolved'):'Open at last recorded sample')),
+      info.append(element('strong',a.vehicle_id+' · '+(a.closed_sequence!==null?'Resolved':'Open at last processed reading')),
         element('small','Captured '+new Date(a.opened_at).toLocaleString()+' · GPS #'+a.opened_sequence+' · peak '+Math.round(a.peak_metres)+' m'));
       const b=element('button','Explain alert');b.onclick=()=>explain(a);row.append(info,b);log.append(row);
     }
@@ -104,7 +104,6 @@ async function explain(a){
 function draw(now){if(fleet&&animate(fleet.cabs,now))frame=requestAnimationFrame(draw);}
 function gps(f,c){
   return {trip_id:c.id,sequence:c.sequence,captured_at:c.capturedAt,
-    motion:motionSnapshot(c),
     lat:f.origin[0]-c.point[1]*f.metres/f.lat_scale,
     lon:f.origin[1]+c.point[0]*f.metres/f.lon_scale};
 }
@@ -149,17 +148,17 @@ function tick(f){
   // Allow movement while a request is in flight, but bound unsent work on slow networks.
   if(running && f.outbox.length<2){
     const before=f.cabs.map(c=>({...c,recovery:c.recovery?[...c.recovery]:undefined}));
-    const moving=f.cabs.filter(c=>advance(c));
+    const moving=f.cabs.filter(c=>c.resumable&&advance(c));
     if(moving.length){
       const time=new Date().toISOString();
       for(const cab of moving)cab.capturedAt=time;
       const batch=moving.map(c=>gps(f,c));
-      try{f.outbox.append(batch);}
+      try{f.outbox.append(batch,simulationSnapshots(f));}
       catch(e){
         f.cabs.forEach((cab,index)=>Object.assign(cab,before[index]));
         running=false;f.failed=true;msg('Unable to save pending GPS locally. '+e.message);render();return;
       }
-      // Map positions come from persisted journey history.
+      // Map positions come from the latest processed GPS checkpoint.
       cancelAnimationFrame(frame);draw(performance.now());
       f.seconds+=5;
     }else running=false;
@@ -212,7 +211,12 @@ async function launch(){
     const trip=await api('me/trips','POST',
       {pickup:$('pickup').value,dropoff:$('dropoff').value},{'Idempotency-Key':dispatchKey});
     if(f!==fleet)return;
-    const c=f.cabs.find(c=>c.id===trip.id)||restoreTrip(trip);
+    let c=f.cabs.find(c=>c.id===trip.id);
+    if(!c){
+      const fresh=makeCab(trip,network);
+      f.outbox.checkpoint({[trip.id]:{point:fresh.point,sequence:0,motion:motionSnapshot(fresh),capturedAt:null}});
+      c=restoreTrip(trip);
+    }
     drawSharedRoads(f.cabs,network);
     closePlanner();running=true;f.failed=false;select(c.id);schedule(f,1000);
     msg(c.vehicle_id+' started at '+c.origin+' for '+c.destination+'.');
@@ -234,52 +238,47 @@ function restoreTrip(trip){
     (fleet.origin[0]-trip.lat)*fleet.lat_scale/fleet.metres];
   if(trip.completed)c.mode='arrived';
   const recordedPoint=[...c.point];
-  if(trip.accepted_point && trip.accepted_point.sequence>c.sequence){
-    const a=trip.accepted_point,resumed=makeCab({...trip,last_sequence:a.sequence,motion:a.motion},network);
+  const local=fleet.outbox.simulations[trip.id];
+  c.resumable=Boolean(local&&!trip.completed&&local.sequence>=trip.last_sequence);
+  if(c.resumable){
+    const resumed=makeCab({...trip,motion:local.motion},network);
     for(const key of ['mode','index','trail','to','recovery'])c[key]=resumed[key];
-    c.sequence=a.sequence;c.capturedAt=a.captured_at;
-    c.point=[(a.lon-fleet.origin[1])*fleet.lon_scale/fleet.metres,(fleet.origin[0]-a.lat)*fleet.lat_scale/fleet.metres];
+    c.sequence=local.sequence;c.capturedAt=local.capturedAt;c.point=[...local.point];
   }
   fleet.cabs.push(c);makeLayers([c],select);showPoint(c,recordedPoint);
   showCabInRoster(c);
   return c;
 }
 
-let historyGeneration=0,historyCursor=0;
-async function loadHistory(f,id,append=false){
+let incidentGeneration=0;
+async function loadAlerts(f,id){
   if(!id)return;
-  const generation=++historyGeneration;
-  if(!append){historyCursor=0;$('historyRows').replaceChildren();$('historyStatus').textContent='Loading recorded journey…';}
+  const generation=++incidentGeneration;
   try{
-    const view=await api('me/trips/'+id+'/history?after='+(append?historyCursor:0));
-    if(f!==fleet||id!==selected||generation!==historyGeneration)return;
-    for(const p of view.readings){
-      const row=element('tr');
-      for(const value of [p.sequence,new Date(p.captured_at).toLocaleString(),
-          p.lat.toFixed(5)+', '+p.lon.toFixed(5),Math.round(p.distance_m||0)+' m',
-          p.timestamp_reversed?'Timestamp reversed':p.sequence_gap?'Sequence gap':p.off_route_sample?'Off route':'On route'])row.append(element('td',value));
-      $('historyRows').append(row);
-    }
-    f.historyAlerts ||= {};
-    f.historyAlerts[id]=view.alerts.map(a=>({...a,id:a.event_key||a.id,vehicle_id:f.cabs.find(c=>c.id===id)?.vehicle_id}));
-    render();
-    historyCursor=view.next_after;
-    $('historyMore').hidden=!view.has_more;
-    $('historyStatus').textContent=view.total+' recorded readings · processed through #'+view.processed_sequence+
-      ' · accepted through #'+view.accepted_sequence+' · '+(view.accepted_sequence>view.processed_sequence?'Processing pending':'History caught up')+
-      '. Gaps or reversed timestamps interrupt incident confirmation.';
-  }catch(e){if(f===fleet&&id===selected)$('historyStatus').textContent=e.message;}
+    const view=await api('me/trips/'+id+'/alerts');
+    if(f!==fleet||id!==selected||generation!==incidentGeneration)return;
+    f.incidents ||= {};f.incidents[id]=view.alerts;render();
+  }catch(e){if(f===fleet)msg(e.message);}
 }
-$('historyMore').onclick=()=>loadHistory(fleet,selected,true);
-$('historyRefresh').onclick=()=>loadHistory(fleet,selected);
-async function pollHistory(f){
+function simulationSnapshots(f){
+  return Object.fromEntries(f.cabs.filter(c=>c.resumable).map(c=>[c.id,{
+    point:[...c.point],sequence:c.sequence,capturedAt:c.capturedAt,motion:motionSnapshot(c)
+  }]));
+}
+function changeMotion(action){
+  const c=chosen();if(!c?.resumable)return;
+  const before={...c,trail:[...c.trail],recovery:c.recovery?[...c.recovery]:undefined};
+  try{action(c);fleet.outbox.checkpoint(simulationSnapshots(fleet));render();}
+  catch(e){Object.assign(c,before);msg('Unable to save simulator state: '+e.message);}
+}
+async function pollPositions(f){
   if(f!==fleet||f.polling)return;
   f.polling=true;
   try{
     const view=await api('me/trips');
     if(f!==fleet)return;
     f.alerts=view.alerts;
-    if(selected && f.cabs.find(c=>c.id===selected)?.confirmed !== view.trips.find(t=>t.id===selected)?.last_sequence)loadHistory(f,selected);
+    loadAlerts(f,selected);
     for(const trip of view.trips){
       let c=f.cabs.find(c=>c.id===trip.id);
       if(!c){c=restoreTrip(trip);drawSharedRoads(f.cabs,network);}
@@ -289,12 +288,12 @@ async function pollHistory(f){
         const point=[(trip.lon-f.origin[1])*f.lon_scale/f.metres,(f.origin[0]-trip.lat)*f.lat_scale/f.metres];
         showPoint(c,point);
       }
-      if(trip.completed)c.mode='arrived';
+      if(trip.completed){c.mode='arrived';c.resumable=false;}
     }
-    $('connection').textContent=view.trips.some(t=>t.processing_pending)?'Journey history processing':'Recorded history updated';
+    $('connection').textContent='Latest processed positions updated';
     cancelAnimationFrame(frame);draw(performance.now());render();
-  }catch(e){if(f===fleet)$('connection').textContent='History unavailable — retrying';}
-  finally{f.polling=false;if(f===fleet)f.pollTimer=setTimeout(()=>pollHistory(f),2000);}
+  }catch(e){if(f===fleet)$('connection').textContent='Positions unavailable — retrying';}
+  finally{f.polling=false;if(f===fleet)f.pollTimer=setTimeout(()=>pollPositions(f),2000);}
 }
 function stopAlertSocket(f){
   if(!f)return;
@@ -315,7 +314,7 @@ function connectAlerts(f){
   socket.onclose=event=>{
     if(f!==fleet||f.socketStopped)return;
     f.socketStates=null;
-    $('alertConnection').textContent='Alert connection lost · using recorded history · reconnecting';
+    $('alertConnection').textContent='Alert connection lost · using latest processed positions · reconnecting';
     render();
     if(event.code===4401){signOut('Please sign in again.');return;}
     f.socketRetry=setTimeout(()=>connectAlerts(f),1500);
@@ -330,10 +329,6 @@ async function setup(){
     const token=sessionStorage.getItem('cabwatch.token');
     const subject=JSON.parse(atob(token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/'))).sub;
     const outbox=new TelemetryOutbox(sessionStorage,subject);
-    if(outbox.hasLegacyReadings()){
-      const saved=await api('me/trips');
-      outbox.upgrade(saved.trips);
-    }
     while(outbox.length){
       await api('me/gps','POST',{readings:outbox.first()});
       outbox.acknowledge();
@@ -357,8 +352,8 @@ async function setup(){
     if(selected){selectMap(fleet.cabs,selected);draw(performance.now());}
     $('alerts').textContent='No recorded deviations for this trip.';$('review').hidden=true;
     $('connection').textContent='● Ready';
-    msg(fleet.cabs.length?'Add a trip or press Start to resume.':'Add a trip to choose a pickup and drop-off.');
-    connectAlerts(fleet);pollHistory(fleet);loadHistory(fleet,selected);
+    msg(fleet.cabs.some(c=>c.resumable)?'Press Start to resume this tab’s saved simulation.':fleet.cabs.length?'Existing trips are display only. Add a trip to simulate here.':'Add a trip to choose a pickup and drop-off.');
+    connectAlerts(fleet);pollPositions(fleet);loadAlerts(fleet,selected);
   }catch(e){
     msg(e.message+' Try again.');$('connection').textContent='Offline';
     const delay=retryDelay(e,0);
@@ -374,9 +369,9 @@ $('launch').onclick=launch;$('cancel').onclick=()=>{closePlanner();render();};
 $('create').onclick=openPlanner;
 $('play').onclick=()=>{if(!fleet)return;running=!running;fleet.failed=false;render();
   msg(running?'Simulation running · each update advances five simulated seconds.':'Simulation paused.');schedule(fleet,0);};
-$('wrong').onclick=()=>{divert(chosen());render();
+$('wrong').onclick=()=>{changeMotion(divert);
   msg(running?'Turn queued for the next junction.':'Turn queued for the next junction. Press Start to drive.');};
-$('return').onclick=()=>{rejoin(chosen());render();
+$('return').onclick=()=>{changeMotion(rejoin);
   msg(running?'Cab is retracing its detour.':'Return requested. Press Start to drive.');};
 let registering=false;
 function signOut(message=''){

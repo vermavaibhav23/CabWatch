@@ -56,15 +56,17 @@ async def runtime(app):
 
 
 async def snapshot(db, user):
-    rows = await db.fetch("""SELECT id,vehicle_id,last_sequence,last_captured_at,
-        processed_at,history_state->>'distance_m' AS distance_m,
-        history_state->'alert' AS alert FROM cab_watch_accounts.trips
-        WHERE user_id=$1 AND completed_at IS NULL ORDER BY id""", user)
+    from .fleet import trip_payload
+    rows = await db.fetch("""SELECT t.*, row_to_json(a) AS alert
+        FROM cab_watch_accounts.trips t LEFT JOIN cab_watch_accounts.alerts a
+        ON a.trip_id=t.id AND a.closed_sequence IS NULL
+        WHERE t.user_id=$1 AND t.completed_at IS NULL ORDER BY t.id""", user)
     return dict(type='off_route_snapshot', vehicles=[dict(
         trip_id=str(row['id']), vehicle_id=row['vehicle_id'], sequence=row['last_sequence'],
-        captured_at=row['last_captured_at'], processed_at=row['processed_at'],
-        distance_m=float(row['distance_m'] or 0), alert=decode(row['alert'], None)
+        captured_at=row['last_captured_at'],lat=row['last_lat'],lon=row['last_lon'],
+        distance_m=trip_payload(row)['distance_m'], alert=decode(row['alert'], None)
     ) for row in rows])
+
 
 
 @router.websocket('/me/alerts/ws')

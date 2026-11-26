@@ -2,20 +2,18 @@ import asyncio
 import json
 import os
 import secrets
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID
-from typing import Literal, Annotated
 
 import httpx
 from fastapi import Depends, APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import AwareDatetime, BaseModel, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, Field
 
 from .agent import generate, tool
 from .admission import TelemetryAdmission
 from . import city
-from .retention import retention_settings, run_retention
 
 ROOT = Path(__file__).parent
 router = APIRouter(prefix="/cab-watch")
@@ -29,42 +27,9 @@ router.include_router(fleet_router)
 from .notifications import router as notifications_router
 router.include_router(notifications_router)
 
-Node = Annotated[str, Field(pattern="^[A-Z]$")]
-
-class RouteMotion(BaseModel):
-    mode: Literal["route", "turn requested"]
-    index: int = Field(ge=0, le=25)
-
-
-class DetourMotion(BaseModel):
-    mode: Literal["detour"]
-    trail: list[Node] = Field(min_length=1)
-    target: Node
-
-    @model_validator(mode="before")
-    @classmethod
-    def accept_previous_checkpoint(cls, value):
-        if isinstance(value, dict) and "trail" not in value and "source" in value:
-            return {**value, "trail": [value["source"]]}
-        return value
-
-
-class ReturnMotion(BaseModel):
-    mode: Literal["returning"]
-    recovery: list[Node] = Field(min_length=1)
-
-
-class ArrivedMotion(BaseModel):
-    mode: Literal["arrived"]
-
-
-Motion = Annotated[RouteMotion | DetourMotion | ReturnMotion | ArrivedMotion, Field(discriminator="mode")]
-
-
 class Point(BaseModel, extra="forbid"):
     trip_id: UUID
     captured_at: AwareDatetime | None = None
-    motion: Motion | None = None
     sequence: int = Field(ge=1, le=2**31-1)
     lat: float = Field(ge=-90, le=90, allow_inf_nan=False)
     lon: float = Field(ge=-180, le=180, allow_inf_nan=False)
@@ -82,19 +47,19 @@ async def latest_alert(conn, trip_id):
 
 async def record(conn, trip, reading):
     from datetime import datetime, timezone
-    from .journey import persist_readings, decode
+    from .journey import persist_readings
     point = reading.model_dump(mode="json")
     point['captured_at'] = point['captured_at'] or datetime.now(timezone.utc).isoformat()
     from .live import milliseconds
     if milliseconds(point['captured_at']) > datetime.now(timezone.utc).timestamp()*1000+2000:
         raise HTTPException(422, 'Capture time is too far in the future')
-    applied = str(reading.sequence) not in decode(trip['readings'], {})
+    applied = reading.sequence > trip['last_sequence'] and trip['completed_at'] is None
     await persist_readings(conn,reading.trip_id,[point])
     updated = await conn.fetchrow('SELECT * FROM cab_watch_accounts.trips WHERE id=$1',reading.trip_id)
-    state = decode(updated['history_state'], {})
+    from .fleet import trip_payload
     alert = await latest_alert(conn,reading.trip_id)
     return dict(trip_id=reading.trip_id,sequence=updated['last_sequence'],applied=applied,
-                distance_m=state.get('distance_m',0),completed=updated['completed_at'] is not None,alert=alert)
+                distance_m=trip_payload(updated)['distance_m'],completed=updated['completed_at'] is not None,alert=alert)
 
 
 async def apply_schema(conn, namespace="cab_watch_accounts"):
@@ -106,17 +71,8 @@ async def apply_schema(conn, namespace="cab_watch_accounts"):
         await conn.execute(f"""ALTER TABLE {namespace}.trips ADD CONSTRAINT valid_planned_route
             CHECK ({namespace}.valid_route(planned_route))""")
 
-    await conn.execute((ROOT / "normalize_trips.sql").read_text(encoding="utf-8").replace("cab_watch_accounts", namespace))
-    await conn.execute((ROOT / "kafka_schema.sql").read_text(encoding="utf-8").replace("cab_watch_accounts", namespace))
-    from .journey import persist_readings
-    # Namespace test schemas use the same migration; rewrite queries via a small adapter.
-    class Namespaced:
-        async def fetchrow(self, query, *args):
-            return await conn.fetchrow(query.replace('cab_watch_accounts',namespace),*args)
-        async def execute(self, query, *args):
-            return await conn.execute(query.replace('cab_watch_accounts',namespace),*args)
-    for row in await conn.fetch(f"SELECT id FROM {namespace}.trips WHERE readings <> '{{}}'::jsonb AND history_state IS NULL ORDER BY id"):
-        await persist_readings(Namespaced(),row['id'],[])
+    from .migration import simplify
+    await simplify(conn, namespace)
 
 
 
@@ -125,13 +81,8 @@ async def cab_runtime(db):
     async with db.acquire() as conn, conn.transaction():
         await conn.execute("SELECT pg_advisory_xact_lock(73949203)")
         await apply_schema(conn)
-    task = asyncio.create_task(run_retention(db, *retention_settings()))
-    try:
-        yield
-    finally:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+    yield
+
 
 
 @router.get("")
@@ -171,24 +122,6 @@ async def ingest(batch: Batch, request: Request, user: UUID=Depends(owner)):
             raise
 
 
-@router.get("/me/trips/{trip_id}/history")
-async def history(trip_id: UUID, request: Request, after: int=0, user: UUID=Depends(owner)):
-    from .journey import decode
-    async with request.app.state.db.acquire() as conn, conn.transaction(isolation='repeatable_read',readonly=True):
-        row=await conn.fetchrow("SELECT * FROM cab_watch_accounts.trips WHERE id=$1 AND user_id=$2",trip_id,user)
-        if row is None:
-            raise HTTPException(404,"Unknown trip")
-        points=sorted(decode(row['readings'],{}).values(),key=lambda p:p['sequence'])
-        page=[p for p in points if p['sequence']>max(0,after)][:1000]
-        alerts=await conn.fetch('SELECT * FROM cab_watch_accounts.alerts WHERE trip_id=$1 ORDER BY opened_sequence,id',trip_id)
-    accepted=decode(row['accepted_point'],{})
-    return dict(readings=page,alerts=[dict(a) for a in alerts],total=len(points),
-                next_after=page[-1]['sequence'] if page else after,
-                has_more=bool(page and page[-1]['sequence']<points[-1]['sequence']),
-                processed_sequence=row['last_sequence'],accepted_sequence=max(row['last_sequence'],accepted.get('sequence',0)),
-                processed_at=row['processed_at'])
-
-
 @router.get("/metrics", include_in_schema=False)
 async def metrics(request: Request):
     expected = os.getenv("METRICS_TOKEN")
@@ -218,29 +151,23 @@ async def ingest_batch(batch, db, user):
 
 
 @router.post("/me/alerts/{alert_id}/explain")
-async def explain(alert_id: str, request: Request,user: UUID=Depends(owner)):
+async def explain(alert_id: int, request: Request,user: UUID=Depends(owner)):
     db = request.app.state.db
-    alert_id = str(alert_id)
-    try:
-        value = int(alert_id) if alert_id.isdecimal() else UUID(alert_id)
-        if isinstance(value, int) and value > 9223372036854775807:
-            raise ValueError("Alert ID exceeds bigint")
-    except ValueError:
-        raise HTTPException(404,"Unknown alert") from None
-    column = "a.id" if isinstance(value,int) else "a.event_key"
-    alert = await db.fetchrow(f"""SELECT a.*,t.vehicle_id FROM cab_watch_accounts.alerts a
+    if not 0 < alert_id <= 9223372036854775807:
+        raise HTTPException(404, 'Unknown alert')
+    alert = await db.fetchrow("""SELECT a.*,t.vehicle_id FROM cab_watch_accounts.alerts a
         JOIN cab_watch_accounts.trips t ON t.id=a.trip_id
-        WHERE t.user_id=$1 AND {column}=$2""",user,value)
+        WHERE t.user_id=$1 AND a.id=$2""",user,alert_id)
     if not alert:
         raise HTTPException(404, "Unknown alert for this simulation")
     facts = dict(vehicle_id=alert["vehicle_id"], threshold_m=city.LIMIT,
                  opened_sequence=alert["opened_sequence"], closed_sequence=alert["closed_sequence"],
                  status="resolved" if alert["closed_sequence"] is not None else "open",
-                 peak_m=round(alert["peak_metres"]), close_reason=alert.get("close_reason"))
+                 peak_m=round(alert["peak_metres"]))
     baseline = (f"{facts['vehicle_id']} triggered the {city.LIMIT} m off-route alert at GPS "
                 f"#{facts['opened_sequence']}. The maximum recorded offset was {facts['peak_m']} m.")
     if facts["closed_sequence"] is not None:
-        baseline += f" Tracking status changed at GPS #{facts['closed_sequence']}: {facts['close_reason'] or 'returned to route'}."
+        baseline += f" The incident resolved at GPS #{facts['closed_sequence']}."
     declarations = [tool("read_alert_evidence", "Read the measured offsets and status for this simulated alert.")]
     contents = [{"role":"user","parts":[{"text":"Call read_alert_evidence then explain the result to a dispatcher "
                 "in two short sentences. The peak is the maximum during the incident. Do not infer the opening distance. Never infer danger or a reason for the detour."}]}]

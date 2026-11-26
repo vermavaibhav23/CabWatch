@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS cab_watch_accounts.trips (
     planned_route jsonb NOT NULL CONSTRAINT valid_planned_route CHECK(cab_watch_accounts.valid_route(planned_route)),
     last_sequence integer NOT NULL DEFAULT 0,
     last_lat double precision, last_lon double precision, last_captured_at timestamptz,
-    motion jsonb,
+    off_route_count integer NOT NULL DEFAULT 0 CHECK(off_route_count BETWEEN 0 AND 3),
     created_at timestamptz NOT NULL DEFAULT now(), completed_at timestamptz,
     UNIQUE(user_id,idempotency_key),
     FOREIGN KEY(vehicle_id,user_id) REFERENCES cab_watch_accounts.vehicles(id,user_id) ON UPDATE CASCADE

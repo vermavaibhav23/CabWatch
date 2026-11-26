@@ -29,7 +29,7 @@ with httpx.Client(timeout=20) as client:
         page.locator('.cabrow').wait_for()
         def reading(seq,node='D'):
             lat,lon=city.gps(city.NODES[node])
-            r=client.post(base+'/me/gps',headers=headers,json={'readings':[dict(trip_id=trip,sequence=seq,captured_at=f'2020-01-01T00:00:0{seq}Z',lat=lat,lon=lon,motion={'mode':'route','index':0})]})
+            r=client.post(base+'/me/gps',headers=headers,json={'readings':[dict(trip_id=trip,sequence=seq,captured_at=f'2020-01-01T00:00:0{seq}Z',lat=lat,lon=lon)]})
             assert r.status_code in (200,202),r.text
             page.wait_for_function('(seq)=>document.querySelector("#distance").textContent.includes("GPS #"+seq)',arg=seq)
         for seq in (1,2,3):reading(seq)
@@ -45,13 +45,14 @@ with httpx.Client(timeout=20) as client:
         page.wait_for_function('document.querySelector("#open").textContent === "0"')
         assert page.locator('.cabpin.offroute').count()==0
         assert page.locator('.cabrow.alarm').count()==0
-        page.locator('#historyRefresh').click()
-        page.wait_for_function('document.querySelectorAll("#historyRows tr").length === 4')
-        assert '2020' in page.locator('#historyRows').inner_text()
+        page.wait_for_function('document.querySelector("#alerts").textContent.includes("Resolved")')
+        assert page.locator('#historyRows').count()==0
+        assert page.locator('#play').is_disabled()  # API-created trip has no local simulator.
+        assert 'Display only' in page.locator('#tripline').inner_text()
         page.reload(wait_until='networkidle')
-        page.wait_for_function('document.querySelectorAll("#historyRows tr").length === 4')
+        page.wait_for_function('document.querySelector("#alerts").textContent.includes("Resolved")')
         out=Path(os.environ.get('CABWATCH_QA_OUTPUT','browser-smoke.png'))
         page.screenshot(path=str(out),full_page=True)
         assert not errors,errors
         browser.close()
-        print('Dashboard smoke passed: historical capture times, deviations, GPS table and reload; no JS errors')
+        print('Dashboard smoke passed: capture times, incident resolution, display-only trips and reload; no JS errors')

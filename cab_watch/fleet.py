@@ -7,7 +7,6 @@ from pydantic import BaseModel, Field
 
 from . import city
 from .auth import owner
-from .journey import decode
 
 router = APIRouter(prefix="/me")
 
@@ -27,16 +26,12 @@ def trip_payload(row):
                   completed=row["completed_at"] is not None,
                   last_sequence=row["last_sequence"], distance_m=distance,
                   lat=row["last_lat"], lon=row["last_lon"], captured_at=row["last_captured_at"],
-                  motion=json.loads(row["motion"]) if row["motion"] else None,
-                  processed_at=row.get('processed_at'),
-                  accepted_point=decode(row.get('accepted_point'),None),
-                  processing_pending=(decode(row.get('accepted_point'),{}).get('sequence',0)>row['last_sequence']))
+                  off_route_count=row['off_route_count'])
 
 
-# Do not transfer potentially large journey JSON on every roster poll.
+# Explicit response fields shared by roster reads and idempotent trip creation.
 TRIP_SELECT = """SELECT t.id,t.user_id,t.idempotency_key,t.vehicle_id,t.planned_route,
-    t.last_sequence,t.last_lat,t.last_lon,t.last_captured_at,t.motion,t.created_at,t.completed_at,
-    t.processed_at,t.accepted_point FROM cab_watch_accounts.trips t"""
+    t.last_sequence,t.last_lat,t.last_lon,t.last_captured_at,t.off_route_count,t.created_at,t.completed_at FROM cab_watch_accounts.trips t"""
 
 
 async def fleet_alerts(conn, user):
@@ -49,14 +44,11 @@ async def fleet_alerts(conn, user):
 async def list_trips(request: Request, user: UUID = Depends(owner)):
     async with request.app.state.db.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
         alerts = [dict(a) for a in await fleet_alerts(conn, user)]
-        for alert in alerts:
-            if alert.get("event_key"):
-                alert["id"]=str(alert["event_key"])
         rows = await conn.fetch(TRIP_SELECT + " WHERE t.user_id=$1 ORDER BY t.created_at", user)
         result = dict(trips=[trip_payload(row) for row in rows], alerts=alerts, limit=city.LIMIT, telemetry_mode="direct")
     if getattr(request.app.state,"pipeline",None):
         result["telemetry_mode"] = "kafka"
-    result['view_mode'] = 'history'
+    result['view_mode'] = 'latest'
     return result
 
 
@@ -88,3 +80,11 @@ async def create_trip(setup: TripRequest, request: Request, response: Response,
             (id,user_id,idempotency_key,vehicle_id,planned_route) VALUES($1,$2,$3,$4,$5::jsonb) RETURNING *""",
             uuid4(), user, idempotency_key, car, json.dumps(route))
         return trip_payload(row)
+
+
+@router.get('/trips/{trip_id}/alerts')
+async def trip_alerts(trip_id: UUID, request: Request, user: UUID = Depends(owner)):
+    rows = await request.app.state.db.fetch("""SELECT a.*,t.vehicle_id
+        FROM cab_watch_accounts.alerts a JOIN cab_watch_accounts.trips t ON t.id=a.trip_id
+        WHERE t.id=$1 AND t.user_id=$2 ORDER BY a.opened_sequence,a.id""",trip_id,user)
+    return dict(alerts=[dict(a) for a in rows])

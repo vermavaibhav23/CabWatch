@@ -1,4 +1,4 @@
-"""One Kafka consumer group for persisted journey and deviation history. No Redis."""
+"""One Kafka consumer group for incremental GPS checkpoints and incidents."""
 import asyncio
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -22,13 +22,12 @@ LAG = Gauge('cabwatch_consumer_lag', 'Offset lag after committed journey transac
 
 
 def reading_from_event(event):
-    """Keep stored readings stable while accepting old and flat Kafka records."""
+    """Normalize old nested and flat envelopes; ignore obsolete route and motion."""
     point = event['point'] if 'point' in event else event
     if point.get('trip_id', event['trip_id']) != event['trip_id']:
         raise ValueError('Telemetry reading trip differs from envelope')
     return dict(trip_id=event['trip_id'], sequence=point['sequence'],
-                captured_at=point['captured_at'], lat=point['lat'], lon=point['lon'],
-                motion=point.get('motion'))
+                captured_at=point['captured_at'], lat=point['lat'], lon=point['lon'])
 
 
 class Stream:
@@ -47,7 +46,7 @@ class Stream:
         ids = [p.trip_id for p in batch.readings]
         if len(set(ids)) != len(ids):
             raise HTTPException(422, 'Send one reading per trip in each batch')
-        rows = await self.db.fetch('SELECT id,vehicle_id,planned_route FROM cab_watch_accounts.trips WHERE user_id=$1 AND id=ANY($2::uuid[])', user, ids)
+        rows = await self.db.fetch('SELECT id,vehicle_id FROM cab_watch_accounts.trips WHERE user_id=$1 AND id=ANY($2::uuid[])', user, ids)
         trips = {r['id']:r for r in rows}
         if len(trips) != len(ids):
             raise HTTPException(422, 'Send readings only for trips in your fleet')
@@ -59,16 +58,8 @@ class Stream:
             if milliseconds(p['captured_at']) > int(now.timestamp()*1000)+2000:
                 raise HTTPException(422, 'Capture time is too far in the future')
             row = trips[point.trip_id]
-            events.append(dict(p, user_id=str(user), vehicle_id=row['vehicle_id'],
-                               route=json.loads(row['planned_route'])))
+            events.append(dict(p, user_id=str(user), vehicle_id=row['vehicle_id']))
         await asyncio.gather(*(self.producer.send_and_wait(self.topic,json.dumps(e).encode(),key=e['vehicle_id'].encode()) for e in events))
-        # Accepted checkpoint survives reloads even while the consumer is behind.
-        # Failure after Kafka ACK returns 503; retry the identical trip/sequence.
-        async with self.db.acquire() as conn, conn.transaction():
-            for e in sorted(events,key=lambda e:e['trip_id']):
-                await conn.execute("""UPDATE cab_watch_accounts.trips SET accepted_point=$2::jsonb
-                    WHERE id=$1 AND coalesce((accepted_point->>'sequence')::integer,0)<$3""",
-                    UUID(e['trip_id']),json.dumps(reading_from_event(e)),e['sequence'])
         return dict(mode='kafka',queued=True,results=[dict(trip_id=e['trip_id'],sequence=e['sequence'],
                     queued=True,applied=False) for e in events])
 
@@ -82,12 +73,11 @@ class Stream:
         async with self.db.acquire() as conn, conn.transaction():
             for tid in sorted(grouped):
                 events=grouped[tid]
-                row=await conn.fetchrow('SELECT user_id,vehicle_id FROM cab_watch_accounts.trips WHERE id=$1',tid)
-                if row is None:
-                    continue
-                if any(e['vehicle_id']!=row['vehicle_id'] or e['user_id']!=str(row['user_id']) for e in events):
-                    raise ValueError('Telemetry ownership differs from stored trip')
-                await persist_readings(conn,tid,[reading_from_event(e) for e in events])
+                first = events[0]
+                if any(e['vehicle_id'] != first['vehicle_id'] or e['user_id'] != first['user_id'] for e in events):
+                    raise ValueError('Inconsistent telemetry ownership within trip batch')
+                await persist_readings(conn,tid,[reading_from_event(e) for e in events],
+                                       expected_user=first['user_id'],expected_vehicle=first['vehicle_id'])
 
     async def consume(self, consumer):
         while True:

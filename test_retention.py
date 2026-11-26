@@ -61,16 +61,6 @@ def run_immediate(coroutine):
 
 
 class RetentionEvidenceTests(unittest.TestCase):
-    def test_alert_records_capture_time_and_peak(self):
-        from cab_watch.journey import analyse
-        trip=dict(id=uuid4(),user_id=uuid4(),vehicle_id='CB#001',planned_route=['G','H','I','J','K'])
-        lat,lon=city.gps(city.NODES['D'])
-        points={str(i):dict(sequence=i,lat=lat,lon=lon,captured_at=f'2020-01-01T00:00:0{i}+00:00') for i in range(1,4)}
-        _,_,alerts,_=analyse(trip,points)
-        self.assertEqual(alerts[0]['opened_sequence'],3)
-        self.assertEqual(alerts[0]['opened_at'],'2020-01-01T00:00:03+00:00')
-        self.assertGreater(alerts[0]['peak_metres'],200)
-
     def test_explanation_uses_alert_fields_without_gps_rows(self):
         trip_id = uuid4()
 
@@ -107,7 +97,7 @@ class RetentionEvidenceTests(unittest.TestCase):
                 if "FROM cab_watch_accounts.trips" in sql:
                     return [dict(id=trip_id,vehicle_id="KA01AB1234",
                                  planned_route=json.dumps(["G","H"]),last_sequence=19,
-                                 completed_at=None,motion=None,
+                                 completed_at=None,off_route_count=0,
                                  last_lat=None,last_lon=None,last_captured_at=None)]
                 return []
 

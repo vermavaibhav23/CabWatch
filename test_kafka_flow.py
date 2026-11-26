@@ -66,7 +66,10 @@ class KafkaFlow(unittest.TestCase):
         self.fail(f"Timed out waiting for recovery; last result {last}")
 
     def history(self):
-        r=self.client.get(f"me/trips/{self.trip}/history");r.raise_for_status();return r.json()
+        r=self.client.get('me/trips');r.raise_for_status()
+        trip=next(t for t in r.json()['trips'] if t['id']==self.trip)
+        alerts=self.client.get(f'me/trips/{self.trip}/alerts').json()['alerts']
+        return dict(total=trip['last_sequence'],alerts=alerts,trip=trip)
 
     @unittest.skipUnless(os.getenv('CABWATCH_FAULT_TESTS')=='1', 'Requires isolated Docker test stack')
     def test_three_partitions_have_three_active_consumers(self):
@@ -85,26 +88,23 @@ class KafkaFlow(unittest.TestCase):
             return len(rows)==3 and len({row[6] for row in rows if row[6]!='-'})==3
         self.wait(assigned,timeout=60)
 
-    def test_late_backlog_replay_and_completion(self):
-        # Old capture times are intentional: history must not depend on wall-clock freshness.
+    def test_older_readings_skipped_and_completion_terminal(self):
         def send(seq,node='D'):
             p=self.point(seq,node);p['captured_at']=f'2020-01-01T00:00:0{seq}Z'
-            r=self.client.post('me/gps',json={'readings':[p]})
-            self.assertEqual(r.status_code,202,r.text)
+            r=self.client.post('me/gps',json={'readings':[p]});self.assertEqual(r.status_code,202,r.text)
         send(1);send(3)
-        self.wait(lambda:self.history()['total']==2)
+        self.wait(lambda:self.history()['total']==3)
         self.assertEqual(self.history()['alerts'],[])
-        send(2)
+        send(2);send(4);send(5)
         self.wait(lambda:len(self.history()['alerts'])==1)
-        send(2);send(4,'H');send(5,'K')
-        self.wait(lambda:self.history()['total']==5)
-        h=self.history()
-        self.assertEqual([p['sequence'] for p in h['readings']],[1,2,3,4,5])
-        self.assertEqual(len(h['alerts']),1)
-        self.assertEqual((h['alerts'][0]['opened_sequence'],h['alerts'][0]['closed_sequence']),(3,4))
-        self.assertTrue(h['alerts'][0]['opened_at'].startswith('2020-01-01'))
-        self.assertTrue(next(t for t in self.client.get('me/trips').json()['trips'] if t['id']==self.trip)['completed'])
-        self.assertEqual(self.client.get('me/live').status_code,404)
+        incident=self.history()['alerts'][0]['id']
+        send(5);send(6,'H');send(7,'K')
+        self.wait(lambda:self.history()['trip']['completed'])
+        send(8)
+        self.assertEqual(self.history()['total'],7)
+        alert=self.history()['alerts'][0]
+        self.assertEqual((alert['id'],alert['opened_sequence'],alert['closed_sequence']),(incident,5,6))
+        self.assertTrue(alert['opened_at'].startswith('2020-01-01'))
 
     @unittest.skipUnless(os.getenv('CABWATCH_FAULT_TESTS')=='1','Local fault injection disabled')
     def test_restart_replays_without_duplicate_history(self):
@@ -130,7 +130,6 @@ class KafkaFlow(unittest.TestCase):
                 self.assertEqual(r.status_code,202,r.text)
             time.sleep(1)
             self.assertEqual(self.history()['total'],0)
-            self.assertEqual(self.history()['accepted_sequence'],3)
             self.assertEqual(httpx.get(URL.split('/cab-watch')[0]+'/healthz').status_code,200)
         finally:
             compose('start','history-worker')

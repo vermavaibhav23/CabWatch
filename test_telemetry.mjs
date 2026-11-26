@@ -37,14 +37,22 @@ test('large fleets upload bounded chunks without losing readings',()=>{
   assert.equal(new Set(received.map(r=>r.trip_id)).size,60);
 });
 
-test('upgrade replays pending passenger GPS and skips obsolete depot movements',()=>{
-  const storage={value:null,getItem(){return this.value;},setItem(key,value){this.value=value;}};
+test('simulator checkpoint and original uploads survive refresh atomically',()=>{
+  const storage={value:null,getItem(){return this.value;},setItem(k,v){this.value=v;}};
   const queue=new TelemetryOutbox(storage,'manager');
-  queue.append([{trip_id:'pickup',sequence:7,leg:0},{trip_id:'direct',sequence:1,leg:0},
-    {trip_id:'ride',sequence:9,leg:1},{trip_id:'return',sequence:4,leg:2}]);
-  queue.upgrade([{id:'pickup',last_sequence:6,lat:null,motion:{mode:'route',index:0}},
-    {id:'direct',last_sequence:0,lat:null,motion:null},{id:'ride',last_sequence:8,lat:13},
-    {id:'return',completed:true}]);
-  assert.deepEqual(queue.first(),[{trip_id:'direct',sequence:1},{trip_id:'ride',sequence:9}]);
-  assert.equal(queue.hasLegacyReadings(),false);
+  const point={trip_id:'t',sequence:20,captured_at:'2020-01-01T00:00:20Z',lat:13,lon:80};
+  const simulation={point:[300,400],sequence:20,motion:{mode:'detour',trail:['G','H'],target:'A'}};
+  queue.append([point],{t:simulation});
+  const refreshed=new TelemetryOutbox(storage,'manager');
+  assert.deepEqual(refreshed.first(),[point]);assert.deepEqual(refreshed.simulations.t,simulation);
+  refreshed.acknowledge();
+  assert.equal(new TelemetryOutbox(storage,'manager').simulations.t.sequence,20);
+  assert.equal(new TelemetryOutbox(storage,'manager').length,0);
+  storage.setItem=()=>{throw Error('quota');};
+  assert.throws(()=>refreshed.append([{...point,sequence:21}],{t:{...simulation,sequence:21}}));
+  assert.equal(refreshed.simulations.t.sequence,20);assert.equal(refreshed.length,0);
+});
+test('a lost local session has no resumable simulations',()=>{
+  const queue=new TelemetryOutbox({getItem(){return null;}},'manager');
+  assert.deepEqual(queue.simulations,{});assert.equal(queue.length,0);
 });

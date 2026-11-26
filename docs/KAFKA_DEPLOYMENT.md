@@ -1,37 +1,128 @@
-> For the new 3-partition topic and WebSocket release, follow the [topic cutover instructions](../README.md#upgrade-an-existing-12-partition-installation) first. Earlier migration notes below describe the historical schema rollout.
+# Safe upgrade: incremental GPS and four tables
 
-# Journey-history cutover
+This upgrade deliberately removes complete GPS history from PostgreSQL. It keeps
+accounts, vehicle IDs, trips, latest processed coordinates and existing numeric
+alert records. Do not run old and new versions against the same database.
 
-This changes the application to one historical Kafka consumer group and four PostgreSQL tables. It does not provision hosting or automatically switch a running service. Existing Render auto-deploy settings may deploy a push to main; coordinate the following before enabling the new code against production.
+## Existing deployment
 
-1. Back up PostgreSQL, Redis and Kafka configuration. Pause GPS senders. On the OLD release, drain both Kafka groups and the Redis `cabwatch:events` SQL outbox. Verify history and pending alert/completion events have reached PostgreSQL. The new release does not read Redis, so deleting Redis first can lose unpersisted events.
-2. Stop every old application replica. Never run old and new schema writers together. Keep old Redis data until the cutover has been verified; the new Compose file leaves its named volume untouched.
-3. Deploy the new code. Startup transactionally copies the fifth table's GPS history into `trips.readings`, rebuilds history state, then drops `telemetry_history`. No `CASCADE` is used. A failed migration rolls back. Existing users, vehicles, trips and legacy alerts remain. On large databases, schedule enough migration time and disk headroom.
-4. Supply `DATABASE_URL`, `TELEMETRY_MODE=kafka`, `KAFKA_BOOTSTRAP_SERVERS`, and `METRICS_TOKEN`. Keep existing SSL/SASL variables (`KAFKA_SECURITY_PROTOCOL`, `KAFKA_SSL_CA_PEM`, `KAFKA_SASL_MECHANISM`, `KAFKA_USERNAME`, `KAFKA_PASSWORD`). Redis settings are no longer used.
-5. Keep `KAFKA_TOPIC=cabwatch.gps.recovery.v1`: this consumer accepts both legacy nested `point` records and new flat records. The NEW group defaults to `<topic>.journey-history-v1`; do not reuse old live/history group IDs. It reads retained data from earliest and deduplicates against stored trip readings. Existing SQL history older than Kafka retention is preserved by migration. Kafka records whose trips were already deleted by retention are skipped.
-6. Defaults: `KAFKA_PARTITIONS=12`, `KAFKA_REPLICATION_FACTOR=1`, `HISTORY_CONSUMERS=1` per process. Existing topics are not resized. For a suitable production cluster use replicated brokers and configure minimum in-sync replicas appropriately. `KAFKA_CREATE_TOPIC=false` permits administrator-managed topics. Retention must cover maximum outage and catch-up time.
-7. Verify `/healthz` reports `journey-history-v2`. Verify exactly users, vehicles, trips and alerts in `cab_watch_accounts`. Upload historical samples including a duplicate and a missing sample arriving late; check capture-time incidents and unique history. Restart a worker and verify unchanged results. Resume senders and reload dashboards.
+1. Pause all simulators/uploads. Wait for each browser's pending uploads to finish.
+   Keep the OLD worker running until the existing group has zero lag on all three
+   partitions. The old API's accepted/processed display can help verify the drain.
 
-The new UI exposes historical processing progress, not a real-time alert guarantee. Legacy alerts remain alongside derived historical incidents. Preserve backups until verified. Rollback to old code requires a coordinated database restore/migration plan: the old code expects a fifth table and Redis state, so do not simply restart it against this schema.
+   ```sh
+   docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group cabwatch.gps.v2.journey-history-v1
+   docker compose stop dashboard history-worker
+   ```
 
-## Flat Kafka message rollout (existing journey-history installations)
+2. With all application writers stopped, back up PostgreSQL. These commands avoid
+   binary shell redirection and work in PowerShell as well as POSIX shells:
 
-Pause GPS uploads and stop all older application replicas before deploying the
-flat-message producer. Deploy all replicas with the compatible reader, then resume
-uploads. Keep the existing topic and journey-history group ID/offsets; do not reset
-offsets or delete queued messages. No database migration is needed for this wire-format
-change. Verify a new record has top-level `sequence`, `captured_at`, `lat`, `lon`
-and `motion`, then check the accepted checkpoint and processed journey history.
+   ```sh
+   docker compose exec -T db pg_dump -U cabwatch -d cabwatch -Fc -f /tmp/cabwatch-before-simplify.dump
+   docker compose cp db:/tmp/cabwatch-before-simplify.dump ./cabwatch-before-simplify.dump
+   docker compose exec -T db pg_restore --list /tmp/cabwatch-before-simplify.dump
+   ```
 
-Do not roll back to a nested-only reader after flat records have been published.
-For rollback, retain the dual-format reader (even if restoring the old producer)
-so queued or replayed flat records remain readable.
+   Store the backup outside container volumes; confirm it exists and test restoring
+   it in a disposable PostgreSQL database before discarding the only copy of history.
+   Do not use `docker compose down -v`. Back up retained Kafka storage too if it is
+   needed for your recovery plan; SQL backup is not a Kafka backup.
 
+3. Check overlapping open alerts before upgrade:
 
-## Separate worker release
+   ```sql
+   SELECT trip_id, array_agg(id ORDER BY id) AS open_alert_ids
+   FROM cab_watch_accounts.alerts
+   WHERE closed_sequence IS NULL
+   GROUP BY trip_id HAVING count(*) > 1;
+   ```
 
-Deploy two process types from the same code/image:
-- API: `uvicorn main:app --host 0.0.0.0 --port 8080` (or the host-provided port).
-- Worker: `python -m cab_watch.worker`.
+   Migration stops transactionally if any exist, naming the affected trip/alert IDs.
+   It never deletes an incident or invents a resolution timestamp. Review the backed-up
+   evidence under the old version; only close incidents if an actual valid return or
+   completion reading proves the closing sequence and capture time. If no such evidence
+   exists, keep the old version/schema until that data conflict is resolved. Do not
+   disable the constraint, merge IDs or fabricate closure evidence to force deployment.
 
-Both need DATABASE_URL, broker settings and Kafka mode. HISTORY_CONSUMERS applies only to the worker. The API no longer launches any consumers. Run at least one worker to process queued data. A web-only deployment accepts records but cannot advance history. This release adds no columns beyond the existing four-table history migration. Stop old combined-process replicas before the worker-outage demonstration. The API metrics endpoint no longer contains the separate worker's lag observations; use Kafka consumer-group lag commands and worker logs for this small demo. There is no live-monitoring guarantee.
+4. Deploy this source. After the verified backup, set `CABWATCH_BACKUP_CONFIRMED=1`
+   in Compose's `.env` (or your deployment environment) for the first startup:
+
+   ```sh
+   docker compose up -d --build
+   docker compose logs --tail 100 dashboard history-worker
+   ```
+
+   Both processes use the same migration advisory lock. Migration initializes counts
+   from matching valid analysis state, or a contiguous suffix of retained evidence
+   where possible, before dropping obsolete columns/history. Unknown counts start at
+   zero; an existing open incident stays open regardless. Completed trips start at zero.
+   The migration preserves current positions and all incident rows/IDs and restores
+   the one-open-alert index. Any error rolls the transaction back, including schema changes.
+   Restarting repeats safely and does not recreate removed fields. Once upgraded,
+   remove the backup-confirmation setting; fresh installs do not require it.
+
+5. Keep topic `cabwatch.gps.v2`, its three partitions, and existing group
+   `cabwatch.gps.v2.journey-history-v1`. **Do not delete/recreate the topic or reset offsets.**
+   The same consumer accepts old nested/flat records while ignoring route/motion fields.
+   Historical records with sequences already processed are skipped. Kafka retention
+   remains seven days, so an outage longer than retention can lose unprocessed evidence.
+
+6. Reload browsers to get the new JavaScript before resuming uploads. Old pending
+   sessionStorage arrays can still retry their GPS fields, but old arrays without
+   complete simulator checkpoints cannot resume movement. Existing trips without
+   this tab's local checkpoint are explicitly display only. Add a new trip if needed;
+   unfinished trips may keep vehicles busy after local session loss.
+
+## Rollback
+
+Before accepting new uploads, rollback means stop both new processes, restore the
+verified backup into a clean replacement database, and deploy the previous source.
+The old binary cannot run against the simplified schema. After accepting new uploads,
+coordinate SQL backup restoration with Kafka offsets and retained records; simply
+rolling code back would lose new checkpoint/incident changes. Do not rewind offsets
+blindly or run mixed versions. Keep the backup until the upgrade has been validated.
+
+## Validation
+
+Check sign-in, idempotent trip creation, latest positions, numeric-ID incident
+explanation, red WebSocket markers and return-to-route clearing. Confirm exactly four
+application tables and the column list in [SCHEMA.md](SCHEMA.md). The live database
+migration is an operator action; changing repository source alone does not back up
+or deploy a running installation.
+
+For disposable integration tests:
+
+```sh
+docker compose -p cabwatch-fastapi-test -f compose.yaml -f compose.test.yaml up -d --build
+```
+
+Set these environment variables in your shell:
+- `CABWATCH_TEST_DATABASE_URL=postgresql://cabwatch:cabwatch@127.0.0.1:15433/cabwatch`
+- `CABWATCH_KAFKA_TEST_URL=http://127.0.0.1:18082/cab-watch`
+- `CABWATCH_FAULT_TESTS=1` only for that isolated Docker project.
+
+Then run `python -m unittest -v test_schema test_kafka_flow test_notifications`.
+For UI tests install `playwright==1.65.2` and run `python -m playwright install chromium`,
+then `python -c "import runpy; runpy.run_path('tests/browser_smoke.py')"` and the same
+command with `tests/browser_recovery.py`. The latter stops/restarts the test worker
+only when fault tests are enabled. All browser tests use local test URLs.
+
+CI runs unit tests, JS state/outbox tests, real PostgreSQL and Kafka tests, browser
+checks with worker-outage refresh, then direct-mode HTTP checks. Assertions include
+three actual consumer assignments, zero ingestion writes, migration rollback,
+no duplicate incidents, timestamp/sequence continuity, restart confirmation counts,
+user isolation, WebSocket reconnects and original pending GPS retries.
+
+## Operational limits
+
+Three asynchronous clients share one worker process. A process crash stops all three;
+Kafka buffers until it restarts. A member failure/rebalance resumes from committed
+offsets, and SQL checkpoints deduplicate replay. A failed SQL batch retries without
+advancing offsets. A permanently malformed retained event can block its partition;
+inspect worker logs and correct the source rather than discarding records silently.
+The project adds neither a dead-letter topic nor a second alert consumer group.
+
+Snapshots are latest processed state, not an audit of every WebSocket notification.
+Use the durable alerts table for incident history. Capture-time labels expose delay;
+WebSockets cannot remove Kafka lag or guarantee instant detection.

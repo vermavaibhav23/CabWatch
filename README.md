@@ -1,154 +1,224 @@
-# CabWatch journey history
+# CabWatch: Kafka fleet monitoring
 
-CabWatch simulates cab/delivery journeys and records GPS deviations from planned routes. It records journey history and pushes confirmed off-route status to the dashboard over a WebSocket. The map shows the latest **processed** reading; processing can lag behind GPS uploads.
+A final-year project demonstrating Dijkstra route planning, asynchronous GPS processing,
+off-route detection, durable consumer recovery and WebSocket dashboard updates.
+It stores the latest processed position and incident history, not every GPS reading.
 
 ## Run
 
 ```sh
-docker compose up --build
+docker compose up -d --build
 ```
 
-Open http://localhost:18080/cab-watch/. Register, add a trip, and start the simulator. Change route creates a detour; Return to route retraces it. Select a trip to see its captured GPS readings, measured deviations, and incidents. Refresh history loads the latest records; Load more paginates older-to-newer readings. The roster lists all trips, including multiple trips by the same vehicle.
+Open http://localhost:18080/cab-watch/, register, add a G-to-K trip and press Change
+Route to simulate a detour. Return to Route retraces it. Existing installations must
+follow [the backup and migration checklist](docs/KAFKA_DEPLOYMENT.md) before updating.
 
-## One Kafka group, four tables
+## Architecture: who does what?
 
 ```mermaid
 flowchart LR
- Browser[Browser GPS] --> API[FastAPI validation]
- API -->|key = vehicle ID| Kafka[GPS topic: 3 partitions]
- Kafka --> Worker[Journey history consumer group]
- Worker -->|one SQL transaction| SQL[(PostgreSQL)]
- SQL --> Dashboard[Recorded journeys and deviations]
+ B[Browser: simulation and pending GPS in sessionStorage] -->|GPS batch| API[FastAPI: JWT, validation, ownership]
+ API -->|one event per reading, vehicle ID key| K[Kafka cabwatch.gps.v2: 3 partitions]
+ K --> C[history-worker: 3 async consumers, one group]
+ C -->|lock trip, process, commit| DB[(PostgreSQL: 4 tables)]
+ DB -->|NOTIFY after commit| WS[FastAPI LISTEN and authenticated WebSocket]
+ WS -->|latest snapshot| UI[Dashboard: red OFF ROUTE markers]
+ UI -->|poll latest positions every 2 seconds| API
+ API -->|read latest positions and incidents| DB
+ C -->|commit next offsets after SQL commit| K
 ```
 
-There is no live Kafka group and no Redis dependency. One group named `<topic>.journey-history-v1` runs three consumer clients in one worker process by default (one partition each after assignment settles); `HISTORY_CONSUMERS` changes the worker count within that group. More workers than partitions cannot add partition-reader parallelism. The local broker has one replica, persistent storage and seven-day retention; it is not highly available.
+FastAPI handles HTTP and WebSockets. It does not consume Kafka. The separate
+`history-worker` process has three asynchronous consumer clients in the same
+`cabwatch.gps.v2.journey-history-v1` group. Each owns one partition when all three
+are healthy. Kafka reassigns partitions if a member disappears. These are three
+async tasks, not three CPU processes. Run one worker service for this configuration.
+The vehicle ID key keeps one vehicle's events on one partition.
 
-Exactly four application tables exist in `cab_watch_accounts`:
+The single local broker uses replication factor 1, persistent storage and seven-day
+retention. This supports restart/buffering demonstrations, not high availability.
+Producer idempotence and `acks=all` remain enabled. No Redis or additional application
+topic is needed. Existing Kafka topics and consumer offsets are not recreated.
 
-| Table | Contents |
-| --- | --- |
-| users | Accounts and signing keys |
-| vehicles | Vehicle ownership and assignment |
-| trips | Planned route, accepted checkpoint, GPS readings keyed by sequence in JSONB, processed checkpoint and analysis state |
-| alerts | Historical off-route incidents and preserved legacy alerts |
+## Final database
 
-`POST /cab-watch/me/gps` validates the entire batch before publishing separate records. `202 queued` follows broker acknowledgment and a PostgreSQL accepted-checkpoint write. It does not mean analysis has finished. Retry the identical trip/sequence after a timeout or 503; a partial send may have succeeded. One active GPS sender per trip is expected.
+Exactly four application tables; the complete [schema diagram and fields](docs/SCHEMA.md)
+and executable [schema.sql](cab_watch/schema.sql) describe them.
 
-The consumer locks each trip, inserts previously unseen readings, rebuilds analysis in sequence order, and commits readings, derived alerts and trip checkpoints together. Only then does it commit Kafka offsets. A crash between SQL commit and offset commit safely replays. The first stored reading for a trip/sequence wins; conflicting duplicate content does not replace it. Historical alert IDs are deterministic, while internal numeric row IDs may change during recomputation. Use `event_key` as the durable incident identifier.
+| Table | Stored data |
+|---|---|
+| users | Account identity, password hash and JWT signing key |
+| vehicles | Generated plate, owner, available/busy assignment |
+| trips | Route, latest processed sequence/valid coordinates/capture time, durable off_route_count |
+| alerts | Stable numeric incident ID, opening/closing GPS sequences, peak deviation and capture times |
 
-Kafka records use a flat envelope: `trip_id`, `user_id`, `vehicle_id`, `route`,
-`sequence`, `captured_at`, `lat`, `lon`, and `motion`. There is no nested `point`
-or duplicated trip ID. The Kafka key remains the vehicle ID. Consumers also read
-older nested `point` records so retained messages can replay on the same topic.
-Accepted checkpoints and stored readings retain their existing reading-only
-shape; routing/ownership metadata is not copied into every stored GPS point.
-Pause uploads and replace all older app replicas before resuming: older consumers
-cannot read the new flat records. See the deployment checklist for rollout and rollback.
+No simulator motion, accepted checkpoint, GPS history JSON, derived history-state
+JSON, processing timestamp, event UUID, close reason or historical flag is stored.
+Trips and incidents are no longer automatically purged; preserve them and manage
+backups as durable project records. Kafka still retains GPS events for seven days.
 
-## Historical detection
+## GPS ingestion and Kafka event
 
-Every reading includes its measured distance and whether it is at least 200 metres off route. An incident requires three consecutive off-route samples, increasing capture timestamps, and no more than ten seconds between capture times. This is an evidence rule, not a processing-time freshness requirement. A week-old backlog still produces events dated at capture time. Missing sequences, reversed timestamps and capture gaps break confirmation; missing data is not proof a vehicle returned to its route. A later missing sample triggers deterministic recomputation. Completed journeys remain terminal for incident analysis; subsequent samples remain in recorded history.
+`POST /cab-watch/me/trips` uses `Authorization: Bearer <JWT>` and a UUID
+`Idempotency-Key` header with `{"pickup":"G","dropoff":"K"}`. The API locks the
+user row, reuses an available vehicle or creates one, computes Dijkstra's route,
+and inserts the trip in one transaction. New trips return 201; identical retries
+return 200 with the same trip. Conflicting reuse of the key returns 409.
 
-The dashboard labels unresolved incidents as open at the last recorded sample, not as current danger. Historical capture times and processing timestamps are exposed. No system can infer a deviation that happened between unrecorded positions.
+`POST /cab-watch/me/gps` accepts one reading per trip per batch (up to 1000):
 
-## API
+```json
+{"readings":[{"trip_id":"20000000-0000-4000-8000-000000000001","sequence":8,"captured_at":"2026-11-26T10:00:08Z","lat":13.095,"lon":80.205}]}
+```
 
-- `GET /healthz`: version `journey-history-v2`, active telemetry mode (liveness only).
-- `POST /cab-watch/me/trips`: create a trip with UUID `Idempotency-Key`.
-- `POST /cab-watch/me/gps`: upload one reading per trip in a batch, maximum 1000.
-- `GET /cab-watch/me/trips`: owned trips, accepted checkpoints, processing status and recent alerts.
-- `GET /cab-watch/me/trips/{id}/history?after=0`: owned GPS history (1000 per page), incident evidence, next cursor and processing progress.
-- `POST /cab-watch/me/alerts/{event_key}/explain`: explain recorded evidence, optionally through Gemini.
-- `GET /cab-watch/metrics`: bearer `METRICS_TOKEN`, consumer lag and retries.
+The browser always supplies an aware capture timestamp. For API compatibility,
+omitting it uses server receipt time; timestamps more than two seconds ahead are
+rejected. The request rejects `motion` and unknown reading fields.
 
-`/me/live` has been removed. `TELEMETRY_MODE=direct` is a database-only development fallback using the same historical analysis; Kafka mode is the default. Do not mix modes against the same active workload.
+A successful Kafka-mode request runs exactly two application SQL statements:
+1. SELECT the JWT signing key.
+2. SELECT owned trip IDs and vehicle IDs.
 
-## Migration and operating limits
+It does **zero PostgreSQL writes**. Admission control, ownership and timestamp checks
+precede publishing. Each reading becomes one event. The API waits for broker ACKs,
+then returns HTTP 202 (analysis may still be pending):
 
-See [the cutover checklist](docs/KAFKA_DEPLOYMENT.md) before replacing a running installation. Startup transactionally folds existing `telemetry_history` rows into `trips.readings`, rebuilds missing history state and then removes the fifth table. Existing legacy alerts are retained and marked `historical=false`; derived historical incidents are separate and may overlap old evidence. Older direct-mode GPS samples were never stored and cannot be reconstructed.
+```json
+{"mode":"kafka","queued":true,"results":[{"trip_id":"20000000-0000-4000-8000-000000000001","sequence":8,"queued":true,"applied":false}]}
+```
 
-JSONB keeps the requested four-table model but has an important cost: each changed trip is read/rebuilt and its JSON rewritten. Very long trips increase CPU, row size and write amplification. This release has **not** been certified for 10,000 vehicles or unbounded trips. Benchmark representative journey lengths, batch sizes, downtime and retention before scaling. If SQL slows down, ingestion checkpoint writes can also fail and clients must retry. Keep Kafka retention longer than your supported outage/backlog. Completed trips and their readings/alerts expire after `TRIP_RETENTION_DAYS` (default 90); active-trip data can continue growing.
+Kafka key: `CB#001`. Value:
 
-## Tests
+```json
+{"trip_id":"20000000-0000-4000-8000-000000000001","user_id":"30000000-0000-4000-8000-000000000001","vehicle_id":"CB#001","sequence":8,"captured_at":"2026-11-26T10:00:08Z","lat":13.095,"lon":80.205}
+```
+
+No route or motion is published. Consumers still accept retained flat records with
+those extra fields and older nested `point` envelopes; obsolete fields are ignored.
+The route is always retrieved from the locked PostgreSQL trip row. A timeout or
+503 can follow a partial Kafka publish: retry identical readings, never renumber.
+
+## Consumer processing and recovery
+
+`getmany` fetches up to 500 records across assigned partitions. For each returned
+partition batch, the consumer groups trips, sorts each trip's readings by sequence,
+and locks trips in deterministic ID order inside one SQL transaction. It verifies
+user/vehicle ownership. Missing trips, completed trips and sequences at or below
+`last_sequence` are skipped. There is no historical reconstruction.
+
+For a newer sequence, calculate the minimum GPS-to-segment distance across the
+planned route. At least 200 m is off route. Three consecutive off-route samples
+confirm an incident. Sequences must be consecutive, timestamps must increase, and
+capture gaps must be at most ten seconds. `off_route_count` is capped at three.
+
+A sequence/time gap resets confirmation. An invalid or reversed capture timestamp
+advances the deduplication sequence and resets the count, but preserves the last
+valid position/time and any open incident. Thus `last_sequence` can identify a
+rejected-time reading while the displayed coordinates retain their actual capture
+time. A valid off-route reading after a gap starts at one. Gaps alone never close
+an already open incident. Valid readings within 200 m resolve it.
+
+| Reading | Deviation | Count | Action |
+|---|---:|---:|---|
+| 1 | 50 m | 0 | On route |
+| 2 | 220 m | 1 | Confirming |
+| 3 | 260 m | 2 | Confirming |
+| 4 | 310 m | 3 | INSERT alert |
+| 5 | 380 m | 3 | UPDATE peak on same alert ID |
+| 6 | 240 m | 3 | Keep open |
+| 7 | 100 m | 0 | UPDATE closing sequence/time |
+
+Within one metre of the destination, the same transaction completes the trip,
+resolves its open incident, resets the count and releases the vehicle. Later GPS
+cannot reopen it. All incident times use capture times. No previous alert is
+removed/recreated. A late sequence lower than the processed checkpoint is discarded;
+this project deliberately does not recover missed historical GPS evidence.
+
+The transaction updates GPS, count and incidents, issues `pg_notify`, then commits.
+Only afterward does the consumer commit Kafka's **next offset**. SQL failure means
+no offset commit. SQL success followed by offset-commit failure means replay, which
+is harmless because `last_sequence` is already durable. Restarting a consumer also
+retains a partially confirmed count (for example two of the required three).
+
+## Dashboard and browser refresh
+
+One sessionStorage value per signed-in user holds the pending upload batches and
+local simulator snapshots: trip ID, coordinates, generated sequence, capture time,
+mode, route index, detour trail/target and return path. A movement tick saves both
+in **one storage write before upload**. Storage failure rolls back in-memory movement.
+ACK removes pending readings without discarding the simulator checkpoint.
+
+Refresh retries the original queued readings, restores the locally generated
+sequence/motion, and waits for Start before moving again. The database's slower
+processed sequence does not rewind the simulator. Change Route and Return to Route
+are saved locally too. One browser/tab must be the simulator for a given trip;
+copying a tab's session and running both is not supported.
+
+Without local state, existing trips are **Display only**. The map still shows their
+latest processed position and incidents, but Start and route controls cannot resume
+them. Add a new trip to simulate. An unfinished trip may leave its vehicle busy if
+its originating browser session is lost; no speculative cross-device recovery occurs.
+
+FastAPI listens for committed PostgreSQL notifications and wakes that user's
+WebSockets. Snapshots join current trips with open alerts and calculate distance
+from stored coordinates. The first WebSocket frame contains `{"token":"<JWT>"}`;
+JWT expiry is rechecked, tokens never go in URLs. Initial/reconnect snapshots and
+five-second reconciliation recover missed notifications. Two-second HTTP polling
+updates positions and incident history. Red markers, OFF ROUTE badges, distance and
+capture time show confirmed incidents. WebSockets deliver processed state, not a
+guarantee that Kafka has no backlog; old capture times remain clearly displayed.
+Snapshots may coalesce intermediate transitions; the durable incident log retains them.
+
+## API inventory
+
+- `POST /cab-watch/auth/register`, `POST /cab-watch/auth/login`: unchanged auth.
+- `GET /cab-watch/network`: fictional road graph.
+- `POST /cab-watch/me/trips`: create/idempotently retry a dispatch.
+- `POST /cab-watch/me/gps`: upload GPS; Kafka mode returns 202.
+- `GET /cab-watch/me/trips`: latest processed positions and recent incidents.
+- `GET /cab-watch/me/trips/{trip_id}/alerts`: selected trip's full incident log.
+- `POST /cab-watch/me/alerts/{numeric_id}/explain`: Gemini or evidence-based fallback.
+- `WS /cab-watch/me/alerts/ws`: user-scoped latest snapshot.
+- `GET /healthz`: liveness, version `incremental-gps-v3`; not dependency readiness.
+- `GET /cab-watch/metrics`: token-protected metrics from the API process only.
+
+The full GPS-history endpoint/table/pagination are removed. Example trip response
+(illustrative distances; actual route lengths come from the graph):
+
+```json
+{"id":"20000000-0000-4000-8000-000000000001","vehicle_id":"CB#001","origin":"G","destination":"K","route":["G","H","I","J","K"],"metres":4140,"completed":false,"last_sequence":0,"distance_m":0,"lat":null,"lon":null,"captured_at":null,"off_route_count":0}
+```
+
+Example incident in the selected-trip response:
+
+```json
+{"alerts":[{"id":42,"trip_id":"20000000-0000-4000-8000-000000000001","vehicle_id":"CB#001","opened_sequence":4,"closed_sequence":7,"peak_metres":380,"opened_at":"2026-11-26T10:00:04Z","resolved_at":"2026-11-26T10:00:07Z"}]}
+```
+
+`TELEMETRY_MODE=direct` remains a development-only fallback using the same incremental
+processor. Stop the Kafka worker first; do not mix direct and Kafka writers.
+
+## Tests and interview demo
 
 ```sh
 python -m pip install -r requirements.txt
 python -m unittest -v test_cab_watch test_retention test_telemetry test_live test_journey test_stream
 node --test test_motion.mjs test_telemetry.mjs
-docker compose -p cabwatch-fastapi-test -f compose.yaml -f compose.test.yaml up -d --build
 ```
 
-With the isolated test stack, set `CABWATCH_TEST_DATABASE_URL=postgresql://cabwatch:cabwatch@127.0.0.1:15433/cabwatch` and `CABWATCH_KAFKA_TEST_URL=http://127.0.0.1:18082/cab-watch`, then run `python -m unittest -v test_schema test_kafka_flow`. Optional `CABWATCH_FAULT_TESTS=1` restarts only the test project's application. Never use a production database for tests. CI also checks direct-mode API ownership, late arrivals and deduplication.
+CI additionally starts an isolated PostgreSQL/Kafka stack, runs migration, HTTP,
+WebSocket, worker restart/outage and three-partition assignment tests, then runs
+Playwright dashboard and refresh tests (including refresh while the real worker is
+stopped). See [deployment/testing instructions](docs/KAFKA_DEPLOYMENT.md).
 
+For the demo: stop `history-worker`, keep the browser running, observe HTTP 202 and
+Kafka lag, then start the worker. Buffered readings update positions/incidents;
+restarting again does not duplicate incidents. PostgreSQL must still be available
+for authentication and ownership checks. Inspect group lag with:
 
-## Final-year demo: independent producer and consumer
+```sh
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group cabwatch.gps.v2.journey-history-v1
+```
 
-Compose runs FastAPI (`dashboard`) and a separate `history-worker` process. The API only produces Kafka messages; it never consumes them. The worker uses the same image with `python -m cab_watch.worker`, owns the history group, and writes PostgreSQL before committing offsets. Either process can initialize the schema, using the same migration lock. Both require PostgreSQL; this demo proves consumer-outage buffering, not database-independent ingestion.
-
-1. Start the stack: `docker compose up -d --build`.
-2. Open the dashboard, create a trip and start movement.
-3. Run `docker compose stop history-worker`. Continue the simulation. Requests return 202, accepted checkpoints advance, but processed history stays behind.
-4. Inspect the backlog:
-   `docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group cabwatch.gps.v2.journey-history-v1`
-5. Run `docker compose start history-worker`. Refresh trip history: buffered readings and capture-time deviations appear as the worker catches up.
-6. Run `docker compose restart history-worker` to demonstrate resumption without duplicate readings.
-
-The Kafka offset command may show no group if the worker has never started. Stop/start retains Kafka and PostgreSQL volumes. In direct development mode, stop the history worker before running a direct-mode API. Do not run the previous combined API/consumer release alongside this release if you want the worker-stop demo to pause all consumption.
-
-## Schema compared with the original four-table drawing
-
-This process split requires **no new database migration**. The earlier historical version already added:
-
-| Table | Additional column | Purpose |
-| --- | --- | --- |
-| trips | readings JSONB NOT NULL DEFAULT '{}' | GPS history keyed by sequence; includes calculated distance and evidence flags |
-| trips | history_state JSONB, nullable | Derived confirmation and incident state |
-| trips | accepted_point JSONB, nullable | Latest upload acknowledged to the simulator |
-| trips | processed_at timestamptz, nullable | Actual history processing time |
-| alerts | event_key UUID, nullable, unique index | Stable identity for a recalculated incident |
-| alerts | close_reason TEXT, nullable | Why an incident ended |
-| alerts | historical BOOLEAN NOT NULL DEFAULT false | Distinguishes derived history from preserved legacy alerts |
-
-Users and vehicles are unchanged. Existing primary keys and foreign keys remain. The physical table is named `alerts` (plural). Kafka offsets are stored in Kafka, not in another SQL table. The one-open-alert index is now restricted to legacy (`historical=false`) rows; historical incidents are rebuilt per trip. Old installations with a fifth `telemetry_history` table still use the documented copy-then-drop migration.
-
-## WebSocket off-route alerts and three partitions
-
-The default application topic is now `cabwatch.gps.v2`, with **3 partitions** and
-**3 consumers** in the existing history group. Run one `history-worker` service;
-its three async consumer tasks share a process (they are not three CPU processes).
-Kafka assigns one partition to each while all three are healthy; on a failure,
-surviving consumers take over. Vehicle ID remains the record key.
-
-The detector still requires three consecutive readings at least 200 m off route.
-After saving each changed journey, it calls PostgreSQL `pg_notify` inside the SQL
-transaction. PostgreSQL delivers that signal only on commit. FastAPI has one
-LISTEN connection and wakes the signed-in user's WebSockets. It reads the latest
-committed state and sends `off_route_snapshot` to `/cab-watch/me/alerts/ws`.
-The first client frame is `{"token":"<access token>"}`; tokens never go in URLs.
-The server verifies the token on connect and again before each snapshot.
-No Redis, second Kafka group, extra table, or schema migration is introduced.
-
-An active incident turns the vehicle marker and roster red with a glowing border,
-an OFF ROUTE badge, measured distance, sequence and capture time. Returning to the
-route or completing the trip clears it. A snapshot on reconnect and every five
-seconds restores state after missed notifications; these are current processed
-states, not a guaranteed delivery stream of every intermediate alert transition.
-The history table retains those incidents. A disconnected socket falls back to
-roster polling and reconnects. WebSocket delivery does not remove Kafka backlog:
-old readings retain their capture time and are never represented as current GPS.
-
-### Upgrade an existing 12-partition installation
-
-Kafka cannot reduce an existing topic's partition count. Do not delete its data.
-Before deploying this release, pause all browser simulators/uploads, let the old
-worker drain `cabwatch.gps.recovery.v1` until group lag is zero, then stop the old
-API and worker. Deploy this release with `docker compose up -d --build` and resume
-uploads. The new topic/group start empty; existing PostgreSQL history is retained.
-Keep the old topic for recovery until its records are no longer needed.
-
-If already switched before draining: pause uploads, stop the new worker, and run
-`docker compose run --rm -e KAFKA_TOPIC=cabwatch.gps.recovery.v1 -e KAFKA_PARTITIONS=12 history-worker`
-until the old group has zero lag, stop that temporary worker, then start the normal
-worker and resume. Never run old/new-topic workers concurrently during cutover.
-On a fresh install only the new three-partition application topic is created.
-Kafka's internal offset topic is separate and must not be resized.
+This is a bounded educational design, not a tested 10,000-vehicle deployment.

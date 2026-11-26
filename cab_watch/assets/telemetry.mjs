@@ -1,46 +1,26 @@
-// Keep unacknowledged readings across refreshes in this browser tab.
+// One atomic sessionStorage value owns simulator checkpoints AND pending GPS.
 export class TelemetryOutbox {
   constructor(storage, owner) {
-    this.storage = storage;
-    this.key = 'cabwatch.telemetry.' + owner;
-    this.batches = JSON.parse(storage.getItem(this.key) || '[]');
+    this.storage=storage;this.key='cabwatch.telemetry.'+owner;
+    const saved=JSON.parse(storage.getItem(this.key)||'null');
+    this.batches=(Array.isArray(saved)?saved:saved?.batches||[]).map(batch=>batch.map(({trip_id,sequence,captured_at,lat,lon})=>({trip_id,sequence,captured_at,lat,lon})));
+    this.simulations=Array.isArray(saved)?{}:saved?.simulations||{};
   }
-
-  get length() { return this.batches.length; }
-  first() { return this.batches[0]?.slice(0, 25); }
-
-  hasLegacyReadings() {
-    return this.batches.some(batch => batch.some(point => 'leg' in point));
+  get length(){return this.batches.length;}
+  first(){return this.batches[0]?.slice(0,25);}
+  save(batches,simulations){
+    // Assign memory only after durable browser storage succeeds.
+    this.storage.setItem(this.key,JSON.stringify({version:2,batches,simulations}));
+    this.batches=batches;this.simulations=simulations;
   }
-
-  // One-time upgrade of readings persisted by the previous dashboard.
-  upgrade(trips) {
-    const saved = new Map(trips.map(trip => [trip.id, trip]));
-    const batches = this.batches.map(batch => batch.flatMap(point => {
-      if (!('leg' in point)) return [point];
-      const {leg, ...reading} = point;
-      const trip = saved.get(point.trip_id);
-      if (!trip || trip.completed || point.sequence <= trip.last_sequence || leg === 2) return [];
-      // A migrated pre-pickup checkpoint now starts at pickup.
-      if (trip.lat === null && trip.motion?.mode === 'route') return [];
-      return [reading];
-    }));
-    this.replace(batches.filter(batch => batch.length));
+  checkpoint(simulations){this.save(this.batches,{...this.simulations,...simulations});}
+  append(batch,simulations={}){
+    if(this.length>=2)throw Error('Telemetry buffer is full.');
+    this.save([...this.batches,batch],{...this.simulations,...simulations});
   }
-
-  append(batch) {
-    if (this.length >= 2) throw Error('Telemetry buffer is full.');
-    this.replace([...this.batches, batch]);
-  }
-
-  acknowledge() {
-    const remaining = this.batches[0].slice(25);
-    this.replace(remaining.length ? [remaining, ...this.batches.slice(1)] : this.batches.slice(1));
-  }
-
-  replace(batches) {
-    this.storage.setItem(this.key, JSON.stringify(batches));
-    this.batches = batches;
+  acknowledge(){
+    const remaining=this.batches[0].slice(25);
+    this.save(remaining.length?[remaining,...this.batches.slice(1)]:this.batches.slice(1),this.simulations);
   }
 }
 
