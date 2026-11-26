@@ -45,8 +45,8 @@ export function makeLayers(cabs,choose){
     svg(pin,'text',{x:0,y:4,'text-anchor':'middle',class:'pinlabel'},c.cab);
     const title=svg(pin,'title',{},c.vehicle_id);
     const updateTitle=()=>{
-      const age=Math.max(0,Math.floor((Date.now()-Date.parse(c.displayCapturedAt||c.capturedAt))/1000));
-      const when=Number.isFinite(age)?'Position recorded '+Math.floor(age/60)+'m '+age%60+'s ago':'GPS capture time unavailable';
+      const age=Math.max(0,Math.floor((Date.now()-Date.parse(c.localSimulation?c.capturedAt:c.displayCapturedAt))/1000));
+      const when=Number.isFinite(age)?(c.localSimulation?'Local simulation captured ':'Last loaded position captured ')+Math.floor(age/60)+'m '+age%60+'s ago':'GPS capture time unavailable';
       title.textContent=c.vehicle_id+(c.offRoute?' · OFF ROUTE':'')+' · '+c.origin+' to '+c.destination+' · '+when;
       pin.setAttribute('aria-label',title.textContent);
     };

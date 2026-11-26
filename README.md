@@ -23,8 +23,9 @@ flowchart LR
  K --> C[history-worker: 3 async consumers, one group]
  C -->|lock trip, process, commit| DB[(PostgreSQL: 4 tables)]
  DB -->|NOTIFY after commit| WS[FastAPI LISTEN and authenticated WebSocket]
- WS -->|latest snapshot| UI[Dashboard: red OFF ROUTE markers]
- UI -->|poll latest positions every 2 seconds| API
+ WS -->|confirmed alerts and trip status only| UI[Dashboard: red OFF ROUTE markers]
+ B -->|animate local coordinates immediately| UI
+ UI -->|initial load or reconnect recovery only| API
  API -->|read latest positions and incidents| DB
  C -->|commit next offsets after SQL commit| K
 ```
@@ -135,7 +136,7 @@ cannot reopen it. All incident times use capture times. No previous alert is
 removed/recreated. A late sequence lower than the processed checkpoint is discarded;
 this project deliberately does not recover missed historical GPS evidence.
 
-The transaction updates GPS, count and incidents, issues `pg_notify`, then commits.
+The transaction updates GPS, count and incidents, issues `pg_notify` only if an alert opens, its peak changes, it closes, or the trip completes, then commits.
 Only afterward does the consumer commit Kafka's **next offset**. SQL failure means
 no offset commit. SQL success followed by offset-commit failure means replay, which
 is harmless because `last_sequence` is already durable. Restarting a consumer also
@@ -160,15 +161,37 @@ latest processed position and incidents, but Start and route controls cannot res
 them. Add a new trip to simulate. An unfinished trip may leave its vehicle busy if
 its originating browser session is lost; no speculative cross-device recovery occurs.
 
-FastAPI listens for committed PostgreSQL notifications and wakes that user's
-WebSockets. Snapshots join current trips with open alerts and calculate distance
-from stored coordinates. The first WebSocket frame contains `{"token":"<JWT>"}`;
-JWT expiry is rechecked, tokens never go in URLs. Initial/reconnect snapshots and
-five-second reconciliation recover missed notifications. Two-second HTTP polling
-updates positions and incident history. Red markers, OFF ROUTE badges, distance and
-capture time show confirmed incidents. WebSockets deliver processed state, not a
-guarantee that Kafka has no backlog; old capture times remain clearly displayed.
-Snapshots may coalesce intermediate transitions; the durable incident log retains them.
+The browser animates locally generated coordinates immediately after saving each
+movement tick, without waiting for backend processing. The bounded pending-upload
+queue still pauses generation if upload failures fill it, preventing silent data loss.
+It never calculates or confirms off-route incidents. Local marker positions are labelled
+as simulation; backend incident timestamps describe when confirmation occurred.
+
+FastAPI listens for committed PostgreSQL notifications only on alert opening, peak
+changes, resolution or trip completion. It reads authorized trip completion status,
+open incidents and recent incident history in a consistent SQL snapshot. Messages
+contain **no vehicle coordinates or per-reading GPS checkpoints**. Completed trips
+are included explicitly, so completion cannot be confused with a missing vehicle.
+
+The first WebSocket frame contains `{"token":"<JWT>"}`; JWT expiry is rechecked and
+tokens never go in URLs. Initial/reconnect status snapshots are immediate. The server
+rechecks status every five seconds to recover missed notifications, sending only
+changed snapshots. The browser sends no periodic WebSocket position requests and
+performs no continuous HTTP polling, including for incident history.
+
+`GET /me/trips` is used on initial load/page refresh and once after a successful
+WebSocket reconnection. Reconnection recovery never overwrites locally simulated
+coordinates. Display-only vehicles retain their last loaded coordinates until a
+page refresh or reconnection. Selecting a trip loads its full incident log once;
+subsequent status snapshots merge recent incident changes into that log. Reconnection
+also refreshes the selected incident log once. Red markers and badges reflect only
+backend-confirmed open incidents; resolution clears them and completion stops local
+movement. Backend messages never move local vehicle markers.
+
+On disconnection the dashboard labels its confirmed status as stale and reconnects
+automatically while local simulation continues. Kafka lag can still delay incident
+confirmation. Snapshots may coalesce intermediate transitions; durable PostgreSQL
+incident records retain them. No database migration is needed for this update.
 
 ## API inventory
 
@@ -179,7 +202,7 @@ Snapshots may coalesce intermediate transitions; the durable incident log retain
 - `GET /cab-watch/me/trips`: latest processed positions and recent incidents.
 - `GET /cab-watch/me/trips/{trip_id}/alerts`: selected trip's full incident log.
 - `POST /cab-watch/me/alerts/{numeric_id}/explain`: Gemini or evidence-based fallback.
-- `WS /cab-watch/me/alerts/ws`: user-scoped latest snapshot.
+- `WS /cab-watch/me/alerts/ws`: user-scoped alert/trip-status snapshot.
 - `GET /healthz`: liveness, version `incremental-gps-v3`; not dependency readiness.
 - `GET /cab-watch/metrics`: token-protected metrics from the API process only.
 

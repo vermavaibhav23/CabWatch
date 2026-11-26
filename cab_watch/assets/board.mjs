@@ -1,6 +1,6 @@
 import {TelemetryOutbox,retryDelay} from './telemetry.mjs?v=incremental1';
 import {makeCab,motionSnapshot,divert,rejoin,advance} from './motion.mjs?v=retrace1';
-import {cityMap,makeLayers,drawSharedRoads,selectMap,showPoint,animate} from './map.mjs?v=alerts1';
+import {cityMap,makeLayers,drawSharedRoads,selectMap,showPoint,animate} from './map.mjs?v=status1';
 
 const $=id=>document.getElementById(id);
 const colors=[
@@ -55,10 +55,9 @@ function render(){
     c.row.classList.toggle('alarm',Boolean(alarm));
     c.map.pin.classList.toggle('offroute',Boolean(alarm));
     c.offRoute=Boolean(alarm);
-    c.badge.textContent=alarm?'OFF ROUTE':c.resumable&&c.confirmed<c.sequence?'GPS processing':c.mode==='turn requested'?'Turn queued':
+    c.badge.textContent=alarm?'OFF ROUTE':c.mode==='turn requested'?'Turn queued':
       c.mode==='detour'?'Route changed':stage(c);
-    const evidence=fleet.socketStates?.[c.id];
-    c.desc.textContent=alarm?Math.round(evidence?.distance_m??c.offset)+' m from route · GPS #'+(evidence?.sequence??c.confirmed)+' · Captured '+new Date(evidence?.captured_at??c.displayCapturedAt).toLocaleTimeString():c.origin+' → '+c.destination;
+    c.desc.textContent=alarm?'Confirmed incident · peak '+Math.round(alarm.peak_metres)+' m · opened GPS #'+alarm.opened_sequence:c.origin+' → '+c.destination;
   }
   const c=chosen();
   if(!c){
@@ -68,11 +67,12 @@ function render(){
   }else{
     $('selected').textContent=c.vehicle_id+' · '+c.origin+' → '+c.destination;
     $('tripline').textContent=c.origin+' → '+c.destination+' · '+(c.metres/1000).toFixed(2)+' km · '+stage(c);
-    const evidence=fleet.socketStates?.[c.id];
-    const captured=evidence?.captured_at??c.displayCapturedAt;
-    $('distance').classList.toggle('offroute-details',Boolean(alertFor(c)));
-    $('distance').textContent=(alertFor(c)?'OFF ROUTE · ':'')+Math.round(fleet.socketStates?.[c.id]?.distance_m??c.offset)+' m from planned route · GPS #'+(evidence?.sequence??c.confirmed)+
-      ' · Recorded '+(captured?new Date(captured).toLocaleString():'not yet')+' · Confirmation: 3 consecutive readings';
+    const alarm=alertFor(c);
+    const captured=c.localSimulation?c.capturedAt:c.displayCapturedAt;
+    $('distance').classList.toggle('offroute-details',Boolean(alarm));
+    $('distance').textContent=(c.localSimulation?'Local simulation GPS #'+c.sequence:'Last loaded GPS #'+c.confirmed)+
+      ' · Captured '+(captured?new Date(captured).toLocaleString():'not yet')+
+      (alarm?' · OFF ROUTE confirmed at GPS #'+alarm.opened_sequence+' · '+new Date(alarm.opened_at).toLocaleString()+' · incident peak '+Math.round(alarm.peak_metres)+' m':' · No backend-confirmed open incident');
     $('wrong').disabled=changing||!c.resumable||c.mode!=='route'||c.index+1>=c.route.length-1;
     $('return').disabled=changing||!c.resumable||!['detour','turn requested'].includes(c.mode);
   }
@@ -158,7 +158,8 @@ function tick(f){
         f.cabs.forEach((cab,index)=>Object.assign(cab,before[index]));
         running=false;f.failed=true;msg('Unable to save pending GPS locally. '+e.message);render();return;
       }
-      // Map positions come from the latest processed GPS checkpoint.
+      // Animate persisted local movement immediately, without waiting for Kafka.
+      for(const cab of moving)showPoint(cab,cab.point);
       cancelAnimationFrame(frame);draw(performance.now());
       f.seconds+=5;
     }else running=false;
@@ -237,15 +238,16 @@ function restoreTrip(trip){
   if(trip.lat!==null)c.point=[(trip.lon-fleet.origin[1])*fleet.lon_scale/fleet.metres,
     (fleet.origin[0]-trip.lat)*fleet.lat_scale/fleet.metres];
   if(trip.completed)c.mode='arrived';
-  const recordedPoint=[...c.point];
   const local=fleet.outbox.simulations[trip.id];
-  c.resumable=Boolean(local&&!trip.completed&&local.sequence>=trip.last_sequence);
-  if(c.resumable){
+  c.localSimulation=Boolean(local&&local.sequence>=trip.last_sequence);
+  c.resumable=c.localSimulation&&!trip.completed;
+  if(c.localSimulation){
     const resumed=makeCab({...trip,motion:local.motion},network);
     for(const key of ['mode','index','trail','to','recovery'])c[key]=resumed[key];
     c.sequence=local.sequence;c.capturedAt=local.capturedAt;c.point=[...local.point];
+    if(trip.completed)c.mode='arrived';
   }
-  fleet.cabs.push(c);makeLayers([c],select);showPoint(c,recordedPoint);
+  fleet.cabs.push(c);makeLayers([c],select);showPoint(c,c.point);
   showCabInRoster(c);
   return c;
 }
@@ -253,11 +255,14 @@ function restoreTrip(trip){
 let incidentGeneration=0;
 async function loadAlerts(f,id){
   if(!id)return;
-  const generation=++incidentGeneration;
+  const generation=++incidentGeneration,version=f.incidentVersion||0;
   try{
     const view=await api('me/trips/'+id+'/alerts');
     if(f!==fleet||id!==selected||generation!==incidentGeneration)return;
-    f.incidents ||= {};f.incidents[id]=view.alerts;render();
+    const merged=new Map(view.alerts.map(a=>[a.id,a]));
+    // A snapshot received during this request takes precedence over its older log.
+    if(version!==(f.incidentVersion||0))for(const a of f.alerts)if(a.trip_id===id)merged.set(a.id,a);
+    f.incidents ||= {};f.incidents[id]=[...merged.values()].sort((a,b)=>a.opened_sequence-b.opened_sequence);render();
   }catch(e){if(f===fleet)msg(e.message);}
 }
 function simulationSnapshots(f){
@@ -271,29 +276,39 @@ function changeMotion(action){
   try{action(c);fleet.outbox.checkpoint(simulationSnapshots(fleet));render();}
   catch(e){Object.assign(c,before);msg('Unable to save simulator state: '+e.message);}
 }
-async function pollPositions(f){
-  if(f!==fleet||f.polling)return;
-  f.polling=true;
+// One recovery read per socket reconnect, never a recurring browser poll.
+async function recoverTrips(f){
   try{
     const view=await api('me/trips');
     if(f!==fleet)return;
-    f.alerts=view.alerts;
-    loadAlerts(f,selected);
     for(const trip of view.trips){
       let c=f.cabs.find(c=>c.id===trip.id);
       if(!c){c=restoreTrip(trip);drawSharedRoads(f.cabs,network);}
-      c.confirmed=trip.last_sequence;c.offset=trip.distance_m;c.displayCapturedAt=trip.captured_at;
-      c.liveCompleted=trip.completed;c.delayed=false;
-      if(trip.lat!==null){
-        const point=[(trip.lon-f.origin[1])*f.lon_scale/f.metres,(f.origin[0]-trip.lat)*f.lat_scale/f.metres];
-        showPoint(c,point);
+      if(!c.localSimulation){
+        c.confirmed=trip.last_sequence;c.offset=trip.distance_m;c.displayCapturedAt=trip.captured_at;
+        if(trip.lat!==null)showPoint(c,[(trip.lon-f.origin[1])*f.lon_scale/f.metres,(f.origin[0]-trip.lat)*f.lat_scale/f.metres]);
       }
-      if(trip.completed){c.mode='arrived';c.resumable=false;}
     }
-    $('connection').textContent='Latest processed positions updated';
+    loadAlerts(f,selected);
     cancelAnimationFrame(frame);draw(performance.now());render();
-  }catch(e){if(f===fleet)$('connection').textContent='Positions unavailable — retrying';}
-  finally{f.polling=false;if(f===fleet)f.pollTimer=setTimeout(()=>pollPositions(f),2000);}
+  }catch(e){if(f===fleet)msg('Fleet recovery failed. Refresh to retry. '+e.message);}
+}
+function applyStatus(f,message){
+  f.incidentVersion=(f.incidentVersion||0)+1;
+  f.socketStates=Object.fromEntries(message.vehicles.map(v=>[v.trip_id,v]));
+  f.alerts=message.alerts;
+  for(const [id,incidents] of Object.entries(f.incidents||{})){
+    const merged=new Map(incidents.map(a=>[a.id,a]));
+    for(const alert of message.alerts)if(alert.trip_id===id)merged.set(alert.id,alert);
+    f.incidents[id]=[...merged.values()].sort((a,b)=>a.opened_sequence-b.opened_sequence);
+  }
+  for(const c of f.cabs){
+    const state=f.socketStates[c.id];
+    if(!state)continue;
+    c.liveCompleted=state.completed;
+    if(state.completed){c.mode='arrived';c.resumable=false;}
+    // Status changes must never overwrite c.point or the map's local target.
+  }
 }
 function stopAlertSocket(f){
   if(!f)return;
@@ -303,18 +318,23 @@ function connectAlerts(f){
   if(f!==fleet||f.socketStopped)return;
   const socket=f.socket=new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/cab-watch/me/alerts/ws');
   socket.onopen=()=>socket.send(JSON.stringify({token:sessionStorage.getItem('cabwatch.token')}));
+  let firstSnapshot=true;
   socket.onmessage=event=>{
     if(f!==fleet||f.socket!==socket)return;
     const message=JSON.parse(event.data);
     if(message.type!=='off_route_snapshot')return;
-    f.socketStates=Object.fromEntries(message.vehicles.map(v=>[v.trip_id,v]));
-    $('alertConnection').textContent='● Alert updates connected · status at captured reading';
+    applyStatus(f,message);
+    if(firstSnapshot){
+      firstSnapshot=false;
+      if(f.socketConnected)recoverTrips(f);
+      f.socketConnected=true;
+    }
+    $('alertConnection').textContent='● Alert updates connected · backend-confirmed incidents';
     render();
   };
   socket.onclose=event=>{
     if(f!==fleet||f.socketStopped)return;
-    f.socketStates=null;
-    $('alertConnection').textContent='Alert connection lost · using latest processed positions · reconnecting';
+    $('alertConnection').textContent='Alert connection lost · showing last confirmed status · reconnecting';
     render();
     if(event.code===4401){signOut('Please sign in again.');return;}
     f.socketRetry=setTimeout(()=>connectAlerts(f),1500);
@@ -336,7 +356,7 @@ async function setup(){
     network=network||await api('network');
     const created=await api('me/trips');
     running=false;clearTimeout(timer);cancelAnimationFrame(frame);reviewGeneration++;selected=null;closePlanner();
-    clearTimeout(fleet?.retryTimer);clearTimeout(fleet?.pollTimer);
+    clearTimeout(fleet?.retryTimer);
     stopAlertSocket(fleet);
     fleet={outbox,...network,...created,savedAlerts:created.alerts,cabs:[],seconds:0,working:false};
     cityMap(network,pick);closePlanner();
@@ -353,7 +373,7 @@ async function setup(){
     $('alerts').textContent='No recorded deviations for this trip.';$('review').hidden=true;
     $('connection').textContent='● Ready';
     msg(fleet.cabs.some(c=>c.resumable)?'Press Start to resume this tab’s saved simulation.':fleet.cabs.length?'Existing trips are display only. Add a trip to simulate here.':'Add a trip to choose a pickup and drop-off.');
-    connectAlerts(fleet);pollPositions(fleet);loadAlerts(fleet,selected);
+    connectAlerts(fleet);loadAlerts(fleet,selected);
   }catch(e){
     msg(e.message+' Try again.');$('connection').textContent='Offline';
     const delay=retryDelay(e,0);
@@ -377,7 +397,7 @@ let registering=false;
 function signOut(message=''){
   stopAlertSocket(fleet);
   sessionStorage.removeItem('cabwatch.token');sessionStorage.removeItem('cabwatch.name');
-  clearTimeout(fleet?.retryTimer);clearTimeout(fleet?.pollTimer);fleet=null;running=false;selected=null;clearTimeout(timer);cancelAnimationFrame(frame);
+  clearTimeout(fleet?.retryTimer);fleet=null;running=false;selected=null;clearTimeout(timer);cancelAnimationFrame(frame);
   $('dashboard').hidden=true;$('account').hidden=false;$('authMessage').textContent=message;
   $('connection').textContent='Signed out';$('password').value='';
 }

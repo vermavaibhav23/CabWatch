@@ -56,17 +56,27 @@ async def runtime(app):
 
 
 async def snapshot(db, user):
-    from .fleet import trip_payload
-    rows = await db.fetch("""SELECT t.*, row_to_json(a) AS alert
-        FROM cab_watch_accounts.trips t LEFT JOIN cab_watch_accounts.alerts a
-        ON a.trip_id=t.id AND a.closed_sequence IS NULL
-        WHERE t.user_id=$1 AND t.completed_at IS NULL ORDER BY t.id""", user)
+    from .fleet import fleet_alerts
+    async with db.acquire() as conn, conn.transaction(isolation='repeatable_read', readonly=True):
+        rows = await conn.fetch("""SELECT t.id,t.vehicle_id,t.completed_at,row_to_json(a) AS alert
+            FROM cab_watch_accounts.trips t LEFT JOIN cab_watch_accounts.alerts a
+            ON a.trip_id=t.id AND a.closed_sequence IS NULL
+            WHERE t.user_id=$1 ORDER BY t.id""", user)
+        alerts = await fleet_alerts(conn, user)
+    # Status only: no coordinates, route geometry, or per-reading GPS checkpoints.
     return dict(type='off_route_snapshot', vehicles=[dict(
-        trip_id=str(row['id']), vehicle_id=row['vehicle_id'], sequence=row['last_sequence'],
-        captured_at=row['last_captured_at'],lat=row['last_lat'],lon=row['last_lon'],
-        distance_m=trip_payload(row)['distance_m'], alert=decode(row['alert'], None)
-    ) for row in rows])
+        trip_id=str(row['id']), vehicle_id=row['vehicle_id'],
+        completed=row['completed_at'] is not None, completed_at=row['completed_at'],
+        alert=decode(row['alert'], None)
+    ) for row in rows], alerts=[dict(a) for a in alerts])
 
+
+
+async def disconnected(ws):
+    # Observe disconnects even when unchanged status suppresses all outgoing frames.
+    while True:
+        if (await ws.receive())['type'] == 'websocket.disconnect':
+            return
 
 
 @router.websocket('/me/alerts/ws')
@@ -75,6 +85,7 @@ async def alerts_socket(ws: WebSocket):
     await ws.accept()
     hub = ws.app.state.notifications
     event, user = asyncio.Event(), None
+    closed = None
     try:
         message = await asyncio.wait_for(ws.receive_json(), 5)
         token = message.get('token', '')
@@ -83,21 +94,34 @@ async def alerts_socket(ws: WebSocket):
         credentials = HTTPAuthorizationCredentials(scheme='Bearer', credentials=token)
         user = await owner(ws, credentials)
         hub.watchers[str(user)].add(event)
+        closed = asyncio.create_task(disconnected(ws))
+        previous = None
         while True:
             event.clear()
             # Revalidate expiry/revocation even on an otherwise idle connection.
             await owner(ws, credentials)
-            await asyncio.wait_for(ws.send_json(jsonable_encoder(await snapshot(hub.db, user))), 5)
+            current = jsonable_encoder(await snapshot(hub.db, user))
+            if current != previous:
+                await asyncio.wait_for(ws.send_json(current), 5)
+                previous = current
+            notified = asyncio.create_task(event.wait())
             try:
-                await asyncio.wait_for(event.wait(), 5)
-            except TimeoutError:
-                pass  # Reconcile reconnects, missed NOTIFY, retention and completion.
+                await asyncio.wait({notified, closed}, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                notified.cancel()
+                await asyncio.gather(notified, return_exceptions=True)
+            if closed.done():
+                break
+            # Five-second reconciliation recovers missed NOTIFY, without GPS requests.
     except (HTTPException, ValueError, AttributeError, TimeoutError):
         with suppress(RuntimeError, WebSocketDisconnect):
             await ws.close(code=4401)
     except WebSocketDisconnect:
         pass
     finally:
+        if closed is not None:
+            closed.cancel()
+            await asyncio.gather(closed, return_exceptions=True)
         if user is not None:
             hub.watchers[str(user)].discard(event)
             if not hub.watchers[str(user)]:

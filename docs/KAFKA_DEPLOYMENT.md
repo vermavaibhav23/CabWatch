@@ -123,6 +123,24 @@ advancing offsets. A permanently malformed retained event can block its partitio
 inspect worker logs and correct the source rather than discarding records silently.
 The project adds neither a dead-letter topic nor a second alert consumer group.
 
-Snapshots are latest processed state, not an audit of every WebSocket notification.
+Snapshots contain confirmed incidents and trip completion, not GPS positions or an audit of every WebSocket notification.
 Use the durable alerts table for incident history. Capture-time labels expose delay;
 WebSockets cannot remove Kafka lag or guarantee instant detection.
+
+
+## WebSocket-only dashboard update (after schema simplification)
+
+This update changes no tables, columns, Kafka topic or consumer group. Rebuild the
+API and worker together and reload browsers for the new JavaScript. Existing schema
+migration/backup instructions above apply only when upgrading an older history schema.
+The worker now notifies only for alert opens, peak changes, closes and completion.
+The API immediately snapshots status after socket authentication and reconciles every
+five seconds; unchanged snapshots are not resent. The browser does no continuous
+GET polling and sends no periodic position requests over WebSocket.
+
+Validate with the browser Network panel: one GET trips at initial load, no repeating
+GET trips/alerts calls while idle or moving, and one GET trips after socket recovery.
+Local markers should keep moving during a worker outage and should never jump to
+server coordinates after socket recovery. Display-only markers refresh their loaded
+position only on initial load/page refresh/reconnection. Browser tests exercise these
+behaviours as well as incident resolution and explicit completion status.

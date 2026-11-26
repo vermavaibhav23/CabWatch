@@ -25,13 +25,14 @@ with httpx.Client(timeout=20) as client:
         errors=[]
         page.on('pageerror',lambda e:errors.append(str(e)))
         page.add_init_script('sessionStorage.setItem("cabwatch.token",'+json.dumps(account['access_token'])+'); sessionStorage.setItem("cabwatch.name","Dashboard QA");')
+        requests=[]
+        page.on('request',lambda r:requests.append((r.method,r.url)))
         page.goto(base+'/',wait_until='networkidle')
         page.locator('.cabrow').wait_for()
         def reading(seq,node='D'):
             lat,lon=city.gps(city.NODES[node])
             r=client.post(base+'/me/gps',headers=headers,json={'readings':[dict(trip_id=trip,sequence=seq,captured_at=f'2020-01-01T00:00:0{seq}Z',lat=lat,lon=lon)]})
             assert r.status_code in (200,202),r.text
-            page.wait_for_function('(seq)=>document.querySelector("#distance").textContent.includes("GPS #"+seq)',arg=seq)
         for seq in (1,2,3):reading(seq)
         page.get_by_text('OFF ROUTE',exact=True).wait_for()
         page.locator('.cabpin.offroute').wait_for()
@@ -49,8 +50,13 @@ with httpx.Client(timeout=20) as client:
         assert page.locator('#historyRows').count()==0
         assert page.locator('#play').is_disabled()  # API-created trip has no local simulator.
         assert 'Display only' in page.locator('#tripline').inner_text()
+        reading(5,'K')
+        page.wait_for_function('document.querySelector("#tripline").textContent.includes("Completed")')
         page.reload(wait_until='networkidle')
         page.wait_for_function('document.querySelector("#alerts").textContent.includes("Resolved")')
+        before=len(requests)
+        page.wait_for_timeout(6500)
+        assert not [url for method,url in requests[before:] if method=='GET' and '/me/trips' in url],requests[before:]
         out=Path(os.environ.get('CABWATCH_QA_OUTPUT','browser-smoke.png'))
         page.screenshot(path=str(out),full_page=True)
         assert not errors,errors

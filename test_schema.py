@@ -138,20 +138,29 @@ class TripSchema(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('motion',row);self.assertNotIn('planned_legs',row)
         self.assertEqual(json.loads(row['planned_route']),['G','H','I','J','K'])
 
-    async def test_notify_is_delivered_only_after_commit(self):
+    async def test_notify_only_for_committed_incident_and_completion_changes(self):
         import asyncio
         await self.seed()
         listener=await asyncpg.connect(os.environ['CABWATCH_TEST_DATABASE_URL']);received=[]
         await listener.add_listener('cabwatch_journey',lambda c,p,ch,payload:received.append(payload))
+        async def count(expected):
+            for _ in range(20):
+                if received.count(str(self.user))>=expected:break
+                await asyncio.sleep(.05)
+            await asyncio.sleep(.1)
+            self.assertEqual(received.count(str(self.user)),expected)
         try:
+            await self.save(self.point(1),self.point(2));await count(0)
             with self.assertRaises(RuntimeError):
                 async with self.db.transaction():
-                    await persist_readings(self.conn,self.trip,[self.point(1)])
+                    await persist_readings(self.conn,self.trip,[self.point(3)])
                     raise RuntimeError('rollback')
-            await asyncio.sleep(.05);self.assertNotIn(str(self.user),received)
-            await self.save(self.point(1))
-            for _ in range(20):
-                if str(self.user) in received:break
-                await asyncio.sleep(.05)
-            self.assertIn(str(self.user),received)
+            await count(0)
+            await self.save(self.point(3));await count(1)
+            await self.save(self.point(3),self.point(4));await count(1)  # replay and unchanged peak
+            await self.save(self.point(5,'A'));await count(2)
+            await self.save(self.point(6,'H'));await count(3)
+            await self.save(self.point(7,'H'));await count(3)  # ordinary on-route GPS
+            await self.save(self.point(8,'K'));await count(4)
+            await self.save(self.point(9));await count(4)  # completed trip
         finally:await listener.close()

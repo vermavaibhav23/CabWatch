@@ -63,18 +63,24 @@ class AlertSockets(unittest.TestCase):
             self.send(1); self.send(2); self.send(3)
             opened = self.until(alice, lambda p: p['vehicles'][0]['alert'] is not None)
             self.assertEqual(opened['vehicles'][0]['alert']['opened_sequence'], 3)
-            self.assertTrue(opened['vehicles'][0]['captured_at'].startswith('2020-01-01'))
-            self.assertGreater(opened['vehicles'][0]['distance_m'], 200)
+            self.assertTrue(opened['vehicles'][0]['alert']['opened_at'].startswith('2020-01-01'))
+            self.assertNotIn('lat',opened['vehicles'][0]);self.assertNotIn('sequence',opened['vehicles'][0])
+            self.assertGreater(opened['vehicles'][0]['alert']['peak_metres'], 200)
             with connect(self.ws_url) as reconnect:
                 self.assertIsNotNone(self.authenticate(reconnect)['vehicles'][0]['alert'])
-            bob_view = json.loads(bob.recv(timeout=10))
-            self.assertEqual([v['trip_id'] for v in bob_view['vehicles']], [self.accounts[1][2]])
-            self.assertIsNone(bob_view['vehicles'][0]['alert'])
-            self.send(4, 'H')
-            cleared = self.until(alice, lambda p: p['vehicles'][0]['sequence']==4)
+            with self.assertRaises(TimeoutError):bob.recv(timeout=6)
+            with connect(self.ws_url) as bob_reconnect:
+                bob_view=self.authenticate(bob_reconnect,1)
+                self.assertEqual([v['trip_id'] for v in bob_view['vehicles']], [self.accounts[1][2]])
+                self.assertIsNone(bob_view['vehicles'][0]['alert'])
+            self.send(4, 'A')
+            higher=self.until(alice,lambda p:p['vehicles'][0]['alert'] is not None and p['vehicles'][0]['alert']['peak_metres']>opened['vehicles'][0]['alert']['peak_metres'])
+            self.assertEqual(higher['vehicles'][0]['alert']['id'],opened['vehicles'][0]['alert']['id'])
+            self.send(5, 'H')
+            cleared = self.until(alice, lambda p: p['vehicles'][0]['alert'] is None)
             self.assertIsNone(cleared['vehicles'][0]['alert'])
-            self.send(5, 'K')
-            self.until(alice, lambda p: not p['vehicles'])
+            self.send(6, 'K')
+            self.until(alice, lambda p: p['vehicles'][0]['completed'])
 
     def test_invalid_token_receives_no_fleet_data(self):
         with connect(self.ws_url) as ws:
@@ -82,3 +88,42 @@ class AlertSockets(unittest.TestCase):
             with self.assertRaises(ConnectionClosed) as closed:
                 ws.recv(timeout=10)
             self.assertEqual(closed.exception.rcvd.code, 4401)
+
+
+    @unittest.skipUnless(os.getenv('CABWATCH_TEST_DATABASE_URL'),'Requires isolated database')
+    def test_reconciliation_recovers_a_change_without_notify(self):
+        import asyncio,asyncpg
+        from uuid import UUID
+        async def update_without_notify():
+            db=await asyncpg.connect(os.environ['CABWATCH_TEST_DATABASE_URL'])
+            try:
+                await db.execute("INSERT INTO cab_watch_accounts.alerts(trip_id,opened_sequence,peak_metres) VALUES($1,3,350)",UUID(self.accounts[0][2]))
+            finally:await db.close()
+        with connect(self.ws_url) as ws:
+            self.authenticate(ws)
+            asyncio.run(update_without_notify())
+            snapshot=self.until(ws,lambda p:p['vehicles'][0]['alert'] is not None)
+            self.assertEqual(snapshot['vehicles'][0]['alert']['peak_metres'],350)
+
+
+class SocketLifecycle(unittest.IsolatedAsyncioTestCase):
+    async def test_quiet_disconnected_socket_releases_subscription(self):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import patch,AsyncMock
+        from cab_watch.notifications import Notifications,alerts_socket
+        hub=Notifications(None);user=uuid4();sent=asyncio.Event();closed=asyncio.Event()
+        class Socket:
+            app=SimpleNamespace(state=SimpleNamespace(notifications=hub))
+            async def accept(self):pass
+            async def receive_json(self):return {'token':'test'}
+            async def send_json(self,payload):sent.set()
+            async def receive(self):
+                await closed.wait();return {'type':'websocket.disconnect'}
+        with patch('cab_watch.notifications.owner',new=AsyncMock(return_value=user)), \
+             patch('cab_watch.notifications.snapshot',new=AsyncMock(return_value={'vehicles':[],'alerts':[]})):
+            task=asyncio.create_task(alerts_socket(Socket()))
+            await asyncio.wait_for(sent.wait(),1)
+            self.assertTrue(hub.watchers[str(user)])
+            closed.set();await asyncio.wait_for(task,1)
+            self.assertEqual(dict(hub.watchers),{})

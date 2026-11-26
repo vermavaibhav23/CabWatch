@@ -1,5 +1,6 @@
 """Incremental, replay-safe GPS processing. Call inside a SQL transaction."""
 import json
+import struct
 from datetime import datetime, timezone, timedelta
 from . import city
 
@@ -50,12 +51,11 @@ async def persist_readings(conn, trip_id, incoming, expected_user=None, expected
     if trip['completed_at'] is not None:
         return
     alert = await conn.fetchrow('SELECT * FROM cab_watch_accounts.alerts WHERE trip_id=$1 AND closed_sequence IS NULL', trip_id)
-    changed = False
+    status_changed = False
     for point in sorted(incoming, key=lambda p: p['sequence']):
         if point['sequence'] <= trip['last_sequence']:
             continue
         result = evaluate(trip, point)
-        changed = True
         trip['last_sequence'] = point['sequence']
         trip['off_route_count'] = result['count']
         if not result['valid']:
@@ -63,25 +63,31 @@ async def persist_readings(conn, trip_id, incoming, expected_user=None, expected
             await conn.execute('UPDATE cab_watch_accounts.trips SET last_sequence=$2,off_route_count=0 WHERE id=$1', trip_id, point['sequence'])
             continue
         captured, distance = result['captured'], result['distance']
+        # Compare at the precision of the REAL column to avoid no-op peak updates.
+        peak = struct.unpack('!f', struct.pack('!f', distance))[0]
         if alert and (distance < city.LIMIT or result['completed']):
             await conn.execute('UPDATE cab_watch_accounts.alerts SET closed_sequence=$2,resolved_at=$3 WHERE id=$1',
                                alert['id'], point['sequence'], captured)
             alert = None
-        elif alert and distance > alert['peak_metres']:
-            await conn.execute('UPDATE cab_watch_accounts.alerts SET peak_metres=$2 WHERE id=$1', alert['id'], distance)
-            alert = {**alert, 'peak_metres': distance}
+            status_changed = True
+        elif alert and peak > alert['peak_metres']:
+            await conn.execute('UPDATE cab_watch_accounts.alerts SET peak_metres=$2 WHERE id=$1', alert['id'], peak)
+            alert = {**alert, 'peak_metres': peak}
+            status_changed = True
         elif alert is None and result['count'] == 3 and not result['completed']:
             alert = await conn.fetchrow("""INSERT INTO cab_watch_accounts.alerts
                 (trip_id,opened_sequence,peak_metres,opened_at) VALUES($1,$2,$3,$4) RETURNING *""",
-                trip_id, point['sequence'], distance, captured)
+                trip_id, point['sequence'], peak, captured)
+            status_changed = True
         await conn.execute("""UPDATE cab_watch_accounts.trips SET last_sequence=$2,last_lat=$3,last_lon=$4,
             last_captured_at=$5,off_route_count=$6,completed_at=$7 WHERE id=$1""",
             trip_id, point['sequence'], point['lat'], point['lon'], captured, result['count'],
             captured if result['completed'] else None)
         trip.update(last_lat=point['lat'], last_lon=point['lon'], last_captured_at=captured)
         if result['completed']:
+            status_changed = True
             await conn.execute("UPDATE cab_watch_accounts.vehicles SET status='available' WHERE id=$1", trip['vehicle_id'])
             break
-    if changed:
+    if status_changed:
         # Delivered only after commit; SQL remains the durable source for reconnects.
         await conn.execute("SELECT pg_notify('cabwatch_journey', $1)", str(trip['user_id']))
