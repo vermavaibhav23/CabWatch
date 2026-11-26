@@ -36,7 +36,7 @@ class Point(BaseModel, extra="forbid"):
 
 
 class Batch(BaseModel):
-    readings: list[Point] = Field(min_length=1, max_length=1000)
+    readings: list[Point] = Field(min_length=1, max_length=100)
 
 
 async def latest_alert(conn, trip_id):

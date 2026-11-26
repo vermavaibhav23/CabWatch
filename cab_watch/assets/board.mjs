@@ -1,4 +1,4 @@
-import {TelemetryOutbox,retryDelay} from './telemetry.mjs?v=incremental1';
+import {TelemetryOutbox,retryDelay} from './telemetry.mjs?v=batch100';
 import {makeCab,motionSnapshot,divert,rejoin,advance} from './motion.mjs?v=retrace1';
 import {cityMap,makeLayers,drawSharedRoads,selectMap,showPoint,animate} from './map.mjs?v=status1';
 

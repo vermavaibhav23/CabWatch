@@ -26,15 +26,17 @@ test('retry respects server delay and stops on client errors',()=>{
 test('large fleets upload bounded chunks without losing readings',()=>{
   const storage={value:null,getItem(){return this.value;},setItem(key,value){this.value=value;}};
   const queue=new TelemetryOutbox(storage,'manager');
-  queue.append(Array.from({length:60},(_,id)=>({trip_id:String(id),sequence:1})));
-  const received=[];
+  queue.append(Array.from({length:250},(_,id)=>({trip_id:String(id),sequence:1})));
+  const received=[],sizes=[];
   while(queue.length){
-    assert.ok(queue.first().length<=25);
+    sizes.push(queue.first().length);
+    assert.ok(queue.first().length<=100);
     received.push(...queue.first());
     queue.acknowledge();
   }
-  assert.equal(received.length,60);
-  assert.equal(new Set(received.map(r=>r.trip_id)).size,60);
+  assert.deepEqual(sizes,[100,100,50]);
+  assert.equal(received.length,250);
+  assert.equal(new Set(received.map(r=>r.trip_id)).size,250);
 });
 
 test('simulator checkpoint and original uploads survive refresh atomically',()=>{

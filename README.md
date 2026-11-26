@@ -67,7 +67,7 @@ user row, reuses an available vehicle or creates one, computes Dijkstra's route,
 and inserts the trip in one transaction. New trips return 201; identical retries
 return 200 with the same trip. Conflicting reuse of the key returns 409.
 
-`POST /cab-watch/me/gps` accepts one reading per trip per batch (up to 1000):
+`POST /cab-watch/me/gps` accepts one reading per trip per batch (up to 100):
 
 ```json
 {"readings":[{"trip_id":"20000000-0000-4000-8000-000000000001","sequence":8,"captured_at":"2026-11-26T10:00:08Z","lat":13.095,"lon":80.205}]}
@@ -82,7 +82,8 @@ A successful Kafka-mode request runs exactly two application SQL statements:
 2. SELECT owned trip IDs and vehicle IDs.
 
 It does **zero PostgreSQL writes**. Admission control, ownership and timestamp checks
-precede publishing. Each reading becomes one event. The API waits for broker ACKs,
+precede publishing. The browser splits larger fleets into requests of at most 100
+readings. Admission control is unchanged. Each reading becomes one event. The API waits for broker ACKs,
 then returns HTTP 202 (analysis may still be pending):
 
 ```json

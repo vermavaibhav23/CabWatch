@@ -1,4 +1,6 @@
 // One atomic sessionStorage value owns simulator checkpoints AND pending GPS.
+const BATCH_LIMIT=100;
+
 export class TelemetryOutbox {
   constructor(storage, owner) {
     this.storage=storage;this.key='cabwatch.telemetry.'+owner;
@@ -7,7 +9,7 @@ export class TelemetryOutbox {
     this.simulations=Array.isArray(saved)?{}:saved?.simulations||{};
   }
   get length(){return this.batches.length;}
-  first(){return this.batches[0]?.slice(0,25);}
+  first(){return this.batches[0]?.slice(0,BATCH_LIMIT);}
   save(batches,simulations){
     // Assign memory only after durable browser storage succeeds.
     this.storage.setItem(this.key,JSON.stringify({version:2,batches,simulations}));
@@ -19,7 +21,7 @@ export class TelemetryOutbox {
     this.save([...this.batches,batch],{...this.simulations,...simulations});
   }
   acknowledge(){
-    const remaining=this.batches[0].slice(25);
+    const remaining=this.batches[0].slice(BATCH_LIMIT);
     this.save(remaining.length?[remaining,...this.batches.slice(1)]:this.batches.slice(1),this.simulations);
   }
 }
